@@ -27,8 +27,8 @@ type Config struct {
 	// Default: kafka.LastOffset
 	AutoOffsetReset int64
 
-	// MaxInFlight is the maximum number of messages being processed concurrently.
-	// This provides backpressure control.
+	// MaxInFlight is the maximum number of messages being processed concurrently,
+	// shared across all assigned partitions.
 	// Default: 1000
 	MaxInFlight int
 
@@ -36,17 +36,14 @@ type Config struct {
 	// Default: 5
 	MinOffsetCommitCount int64
 
-	// MaxCommitInterval is the maximum time between sequential commits. When elapsed,
-	// commit() will trigger even if MinOffsetCommitCount has not been reached, as long
-	// as there is a new contiguous done offset to commit.
+	// MaxCommitInterval is the maximum time between commits. Once elapsed, a commit
+	// fires even below MinOffsetCommitCount, provided the next offset is already done.
 	// Default: 5 seconds
 	MaxCommitInterval time.Duration
 
-	// ForceCommitInterval controls how often ForceCommit runs. ForceCommit advances the
-	// committed offset to the highest contiguous done offset even when there are in-flight
-	// messages ahead of it — it skips gaps rather than waiting for them to fill in.
-	// This is distinct from MaxCommitInterval, which only triggers when the next offset
-	// is already done (no gaps).
+	// ForceCommitInterval is how often the committed offset is advanced to the highest
+	// contiguous done offset regardless of the thresholds above. Unlike
+	// MaxCommitInterval it fires even when the next offset is still in flight.
 	// Default: 5 seconds
 	ForceCommitInterval time.Duration
 
@@ -58,41 +55,37 @@ type Config struct {
 	// Default: 100ms
 	CommitRetryDelay time.Duration
 
-	// UnOrdered disables key-based message ordering and sequencing.
-	// When true, messages with the same key can be processed concurrently,
-	// maximizing throughput at the cost of ordering guarantees.
+	// UnOrdered disables key sequencing, trading ordering guarantees for throughput.
 	// Default: false
 	UnOrdered bool
 
 	// RetryCount is the number of times to retry HandleMessage before giving up.
-	// Default: 0 (no retries; the zero value means no retries)
+	// Default: 0 (no retries)
 	RetryCount int
 
 	// RetryDelay is the delay between retry attempts.
 	// Default: 500ms
 	RetryDelay time.Duration
 
-	// DeadLetterPersister is an optional persister for messages that failed after all retries.
-	// If provided, exhausted messages will be saved for inspection/manual replay.
+	// DeadLetterPersister optionally captures messages that failed after all retries.
 	DeadLetterPersister DeadLetterPersister
 
-	// MaxQueuedPerKey is the maximum number of messages allowed per key in the
-	// KeySequencer queue. OverflowPolicy decides what happens once it is reached.
+	// MaxQueuedPerKey is the maximum number of messages queued per key.
+	// OverflowPolicy decides what happens once it is reached.
 	// Default: 100
 	MaxQueuedPerKey int
 
 	// OverflowPolicy determines what happens when a key's queue reaches
-	// MaxQueuedPerKey. The default, OverflowBlock, applies backpressure and never
-	// discards a message. The drop policies trade data loss for throughput:
-	// dropped messages are handed to DeadLetterPersister (if configured) and their
-	// offsets are marked done so commits keep advancing past them.
-	// Default: OverflowBlock
+	// MaxQueuedPerKey. The drop policies trade data loss for throughput: dropped
+	// messages go to DeadLetterPersister and their offsets are marked done so commits
+	// keep advancing past them.
+	// Default: OverflowBlock (backpressure, never discards)
 	OverflowPolicy OverflowPolicy
 
-	// ShutdownTimeout is the total budget for Stop() to drain gracefully: draining the
-	// key sequencer queue and waiting on in-flight handlers share this one deadline.
-	// Once it elapses, in-flight handler contexts are canceled. Stop() may still take
-	// slightly longer while it commits offsets and closes the reader (bounded by MaxWait).
+	// ShutdownTimeout is the total budget for Stop() to drain gracefully; draining the
+	// key sequencer and waiting on in-flight handlers share this one deadline. Once it
+	// elapses, in-flight handler contexts are canceled. Stop() may still take slightly
+	// longer to leave the consumer group and flush a final commit per partition.
 	// Default: 30 seconds
 	ShutdownTimeout time.Duration
 
@@ -108,10 +101,33 @@ type Config struct {
 	MaxBytes int
 
 	// MaxWait is the maximum time the broker holds a fetch request open waiting for
-	// MinBytes to accumulate. It also bounds how long Stop() blocks closing the reader,
-	// since an in-flight fetch must return first.
+	// MinBytes to accumulate.
 	// Default: 10 seconds
 	MaxWait time.Duration
+
+	// SessionTimeout is how long the group coordinator waits without a heartbeat
+	// before declaring this member dead and rebalancing.
+	// Default: 30 seconds
+	SessionTimeout time.Duration
+
+	// RebalanceTimeout is how long the coordinator waits for members to rejoin during
+	// a rebalance. Raise it for groups whose members are slow to leave a generation.
+	// Default: 30 seconds
+	RebalanceTimeout time.Duration
+
+	// HeartbeatInterval is how often this member heartbeats to the coordinator, and
+	// should be well below SessionTimeout.
+	// Default: 3 seconds
+	HeartbeatInterval time.Duration
+
+	// WatchPartitionChanges triggers a rebalance when the topic's partition count
+	// changes.
+	// Default: false
+	WatchPartitionChanges bool
+
+	// PartitionWatchInterval is the poll interval for WatchPartitionChanges.
+	// Default: 5 seconds
+	PartitionWatchInterval time.Duration
 }
 
 func (c *Config) applyDefaults() {
@@ -155,6 +171,22 @@ func (c *Config) applyDefaults() {
 		c.MaxWait = 10 * time.Second
 	}
 
+	if c.SessionTimeout == 0 {
+		c.SessionTimeout = 30 * time.Second
+	}
+
+	if c.RebalanceTimeout == 0 {
+		c.RebalanceTimeout = 30 * time.Second
+	}
+
+	if c.HeartbeatInterval == 0 {
+		c.HeartbeatInterval = 3 * time.Second
+	}
+
+	if c.PartitionWatchInterval == 0 {
+		c.PartitionWatchInterval = 5 * time.Second
+	}
+
 	if c.MaxQueuedPerKey == 0 {
 		c.MaxQueuedPerKey = 100
 	}
@@ -166,8 +198,6 @@ func (c *Config) applyDefaults() {
 	if c.Logger == nil {
 		c.Logger = slog.Default()
 	}
-
-	// UnOrdered defaults to false (key sequencing enabled by default)
 }
 
 func (c *Config) Validate() error {

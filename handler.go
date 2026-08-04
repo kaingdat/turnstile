@@ -6,26 +6,22 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
+// Message is the message type handlers receive.
 type Message = kafka.Message
 
-// MessageHandler defines the interface for processing Kafka messages.
-// Users must implement this interface to handle messages consumed from Kafka.
+// MessageHandler processes messages consumed from Kafka.
 type MessageHandler interface {
-	// HandleMessage processes a single Kafka message.
-	// Return an error if processing fails; the library will handle retries based on configuration.
+	// HandleMessage processes a single message. Returning an error triggers retries
+	// per RetryCount, then dead-lettering.
 	HandleMessage(ctx context.Context, message Message) error
 
-	// GetKey extracts a unique key from the message for ordered processing.
-	// Messages with the same key will not be processed concurrently.
-	// Return empty string to disable key-based sequencing for this message.
+	// GetKey extracts the ordering key. Messages sharing a key are never processed
+	// concurrently. Return "" to skip sequencing for this message.
 	GetKey(key []byte, value []byte) string
 }
 
-// DeadLetterPersister defines the interface for persisting messages that failed
-// after all retry attempts. Users can implement this to store dead-lettered
-// messages in their preferred storage (database, file, etc.) for inspection.
+// DeadLetterPersister stores messages that failed after all retry attempts.
 type DeadLetterPersister interface {
-	// Save stores a dead-lettered message with its error information.
 	Save(ctx context.Context, message Message, err error, key string) error
 }
 

@@ -225,8 +225,8 @@ func keyName(i int) string {
 	return "key-" + string(rune('A'+i%26)) + "-" + string(rune('0'+i/26))
 }
 
-// TestKeySequencer_Release_KeepsKeyLocked verifies that after release, a key with
-// queued messages stays locked — preventing a new message from jumping the queue.
+// A key with queued messages stays locked after release, so a new message cannot jump
+// the queue.
 func TestKeySequencer_Release_KeepsKeyLocked(t *testing.T) {
 	ks := newKeySequencer(10, OverflowDropOldest)
 
@@ -268,9 +268,8 @@ func TestKeySequencer_Release_KeepsKeyLocked(t *testing.T) {
 	ks.release("K")
 }
 
-// TestKeySequencer_Release_FIFO_Under_Contention stresses the release/submit
-// boundary with concurrent goroutines and asserts that per-key dequeue order
-// is FIFO (monotonically increasing offsets within each key).
+// Stresses the release/submit boundary, where a lost ordering guarantee would show up
+// as non-monotonic offsets within a key.
 func TestKeySequencer_Release_FIFO_Under_Contention(t *testing.T) {
 	ks := newKeySequencer(1000, OverflowDropOldest)
 
@@ -280,8 +279,7 @@ func TestKeySequencer_Release_FIFO_Under_Contention(t *testing.T) {
 	var wg sync.WaitGroup
 	start := make(chan struct{})
 
-	// Each worker uses its own key and submits messages with offsets 0..messagesPerWorker-1
-	// in order. Dequeued messages for each key must therefore come out in that order.
+	// Each worker submits its own key's offsets in order, so dequeues must match.
 	for w := range workers {
 		wg.Add(1)
 		go func(id int) {
@@ -344,8 +342,6 @@ func TestKeySequencer_Release_FIFO_Under_Contention(t *testing.T) {
 	}(), len(dequeuedOffsets))
 }
 
-// TestKeySequencer_Release_EmptyQueue_UnlocksKey verifies that release
-// fully unlocks the key when the queue is empty.
 func TestKeySequencer_Release_EmptyQueue_UnlocksKey(t *testing.T) {
 	ks := newKeySequencer(10, OverflowDropOldest)
 
@@ -374,15 +370,13 @@ func TestKeySequencer_Release_EmptyKey_Noop(t *testing.T) {
 	}
 }
 
-// TestKeySequencer_Dequeue_PendingKeyWithEmptyQueue exercises the defensive
-// branch in dequeue where a pending key has no remaining queue entries. This
-// shouldn't happen via the public API, but the branch guarantees liveness and
-// must release the handling slot rather than block forever.
+// Drives dequeue's defensive branch for a pending key with no queue entries. The
+// public API should never produce this, but the branch must release the handling slot
+// rather than block forever.
 func TestKeySequencer_Dequeue_PendingKeyWithEmptyQueue(t *testing.T) {
 	ks := newKeySequencer(10, OverflowDropOldest)
 
-	// Manually construct the inconsistent state: key marked pending + handled
-	// but no queued messages.
+	// Construct the inconsistent state directly: pending + handled, nothing queued.
 	ks.mu.Lock()
 	ks.handlingKeys["ghost"] = struct{}{}
 	ks.pendingKeys["ghost"] = struct{}{}
@@ -400,10 +394,8 @@ func TestKeySequencer_Dequeue_PendingKeyWithEmptyQueue(t *testing.T) {
 	}
 }
 
-// TestKeySequencer_Dequeue_FallbackScan exercises the defensive fallback in
-// dequeue when a queued message exists for a key not currently in handlingKeys
-// (and not in pendingKeys). This branch preserves liveness; we drive it by
-// constructing the state directly.
+// Drives dequeue's fallback scan: a queued message for a key in neither handlingKeys
+// nor pendingKeys. Unreachable via the public API, so the state is built directly.
 func TestKeySequencer_Dequeue_FallbackScan(t *testing.T) {
 	ks := newKeySequencer(10, OverflowDropOldest)
 
@@ -502,8 +494,7 @@ func TestKeySequencer_Drain_ContextCanceled(t *testing.T) {
 	}
 }
 
-// TestKeySequencer_PendingKeys_ClearedOnDequeue verifies that pendingKeys
-// is properly cleaned up during dequeue across multiple keys.
+// pendingKeys entries must not accumulate across dequeues.
 func TestKeySequencer_PendingKeys_ClearedOnDequeue(t *testing.T) {
 	ks := newKeySequencer(10, OverflowDropOldest)
 
@@ -553,7 +544,7 @@ func TestKeySequencer_OverflowDropNewest_KeepsQueuedOrder(t *testing.T) {
 	mustSubmit(t, ks, createTestMessage("t", 0, 1, "k", "v1"), "k")
 	mustSubmit(t, ks, createTestMessage("t", 0, 2, "k", "v2"), "k")
 
-	// Queue is full; the incoming message is the one discarded.
+	// Queue is full, so the incoming message is the one discarded.
 	_, evicted, err := ks.submit(context.Background(), createTestMessage("t", 0, 3, "k", "v3"), "k")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -652,5 +643,31 @@ func TestKeySequencer_OverflowBlock_ContextCanceled(t *testing.T) {
 	// The message must not have been queued behind the caller's back.
 	if ks.queuedMessageCount() != 1 {
 		t.Fatalf("expected queue size 1, got %d", ks.queuedMessageCount())
+	}
+}
+
+// The fallback scan exists for liveness, so it must tolerate the queue bookkeeping it
+// is there to backstop — including a key whose queue was emptied but not deleted.
+func TestDequeue_FallbackSkipsEmptyQueues(t *testing.T) {
+	ks := newKeySequencer(2, OverflowBlock)
+
+	ks.keyQueues["a"] = list.New()
+	ks.keyQueues["b"] = list.New()
+
+	if _, _, ok := ks.dequeue(); ok {
+		t.Fatal("dequeue returned a message from empty queues")
+	}
+
+	q := list.New()
+	q.PushBack(messageWithKey{msg: createTestMessage("t", 0, 5, "c", "v"), key: "c"})
+	ks.keyQueues["c"] = q
+	ks.totalQueuedMessages = 1
+
+	msg, key, ok := ks.dequeue()
+	if !ok {
+		t.Fatal("dequeue skipped a non-empty queue behind the empty ones")
+	}
+	if key != "c" || msg.Offset != 5 {
+		t.Fatalf("dequeued (%q, offset %d), want (\"c\", offset 5)", key, msg.Offset)
 	}
 }

@@ -66,7 +66,7 @@ if [ "$COVERAGE" = "coverage" ]; then
     go test -tags=integration -v -timeout=20m -race \
         -coverprofile=coverage_integration.out \
         -covermode=atomic \
-        -coverpkg=github.com/datzero9/turnstile \
+        -coverpkg=github.com/kaingdat/turnstile \
         ./tests/...
 else
     go test -tags=integration -v -timeout=20m -race ./tests/...

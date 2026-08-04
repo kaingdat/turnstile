@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/datzero9/turnstile"
+	"github.com/kaingdat/turnstile"
 	"github.com/segmentio/kafka-go"
 )
 
@@ -102,6 +102,12 @@ func (h *testMessageHandler) GetKey(key []byte, value []byte) string {
 
 func (h *testMessageHandler) GetProcessedCount() int64 {
 	return h.processedCount.Load()
+}
+
+func (h *testMessageHandler) GetProcessedMessages() []kafka.Message {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]kafka.Message(nil), h.processedMsgs...)
 }
 
 func (h *testMessageHandler) GetErrorCount() int64 {
@@ -218,18 +224,17 @@ const (
 	testTopic      = "turnstile-test-topic"
 	testTimeout    = 30 * time.Second
 	messageTimeout = 10 * time.Second
-	// testMaxWait bounds how long an in-flight fetch pins reader.Close during Stop.
+	// testMaxWait bounds how long an in-flight fetch pins a partition reader's close.
 	testMaxWait = 250 * time.Millisecond
 )
 
-// uniqueName returns a fresh name for a per-test topic or group ID, using nanosecond
-// resolution so two tests running in the same second do not collide.
+// uniqueName uses nanosecond resolution so tests running in the same second do not
+// collide.
 func uniqueName(prefix, label string) string {
 	return fmt.Sprintf("%s-%s-%d", prefix, label, time.Now().UnixNano())
 }
 
-// writeMessages writes value-only copies of the given messages to partition 0 of topic.
-// It skips the test if Kafka is unavailable.
+// writeMessages writes value-only copies to partition 0, skipping if Kafka is down.
 func writeMessages(t *testing.T, topic string, messages []kafka.Message) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
@@ -250,9 +255,8 @@ func writeMessages(t *testing.T, topic string, messages []kafka.Message) {
 	}
 }
 
-// createTopic explicitly creates a topic with the given partition count, skipping the
-// test if Kafka is unavailable. Needed because auto-create defaults to a single partition,
-// which makes multi-consumer assignment impossible.
+// createTopic is needed because auto-create defaults to one partition, which makes
+// multi-consumer assignment impossible.
 func createTopic(t *testing.T, topic string, partitions int) {
 	t.Helper()
 	conn, err := kafka.Dial("tcp", testBroker)
@@ -280,12 +284,12 @@ func createTopic(t *testing.T, topic string, partitions int) {
 		t.Fatalf("Failed to create topic %s: %v", topic, err)
 	}
 
-	// Wait for partition leaders to be elected — without this, an immediate
-	// produce can hit "Not Leader For Partition" while metadata propagates.
+	// Without this an immediate produce can hit "Not Leader For Partition" while
+	// metadata propagates.
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		ready := true
-		for p := 0; p < partitions; p++ {
+		for p := range partitions {
 			leaderConn, err := kafka.DialLeader(context.Background(), "tcp", testBroker, topic, p)
 			if err != nil {
 				ready = false
@@ -622,8 +626,7 @@ func TestGracefulShutdown(t *testing.T) {
 	processedAfter := handler.GetProcessedCount()
 	t.Logf("Processed before shutdown: %d, after shutdown: %d", processedBefore, processedAfter)
 
-	// Stop() must drain in-flight handlers (procCtx outlives fetch ctx). Strictly the
-	// count should be >= processedBefore + 1 (the in-flight ones complete).
+	// Stop() must drain in-flight handlers, since procCtx outlives the fetch context.
 	if processedAfter < processedBefore {
 		t.Errorf("Processed count regressed: before=%d after=%d", processedBefore, processedAfter)
 	}
@@ -962,8 +965,7 @@ func TestPartitionRebalanceWithMultipleConsumers(t *testing.T) {
 	consumer1.Start()
 	defer consumer1.Stop()
 
-	// Wait until consumer1 owns partitions and is making progress, rather than
-	// sleeping a fixed interval and hoping the group has settled.
+	// Poll for progress rather than sleeping and hoping the group has settled.
 	if !waitForCondition(15*time.Second, 50*time.Millisecond, func() bool {
 		return handler1.GetProcessedCount() > 0
 	}) {
@@ -993,8 +995,7 @@ func TestPartitionRebalanceWithMultipleConsumers(t *testing.T) {
 	moreMessages := createTestMessages(topic, 0, 50, "key2", "value2")
 	writeMessages(t, topic, moreMessages)
 
-	// Both batches should land across the two consumers; poll for that instead of
-	// sleeping out the worst-case rebalance time.
+	// Poll instead of sleeping out the worst-case rebalance time.
 	wantTotal := int64(len(messages) + len(moreMessages))
 	waitForCondition(20*time.Second, 100*time.Millisecond, func() bool {
 		return handler1.GetProcessedCount()+handler2.GetProcessedCount() >= wantTotal
@@ -1045,7 +1046,7 @@ func TestConsumerRestartRebalance(t *testing.T) {
 		t.Fatalf("First consumer did not process first batch in time (got %d)", handler.GetProcessedCount())
 	}
 
-	// No sleep needed: Stop() runs a final ForceCommit, so the first consumer's
+	// No sleep needed: Stop() flushes on leaving the group, so the first consumer's
 	// progress is durable by the time consumer2 joins.
 	processedAfterFirst := handler.GetProcessedCount()
 	t.Logf("First consumer processed %d messages", processedAfterFirst)
@@ -1070,8 +1071,352 @@ func TestConsumerRestartRebalance(t *testing.T) {
 	}
 }
 
-// TestConfigValidate exercises Validate's error branches. Pure unit test —
-// no Kafka required even under the integration tag.
+// startPartitionProducer writes one message per partition on a ticker until stopped,
+// returning the round count — so each partition holds exactly that many messages at
+// offsets 0..n-1.
+//
+// The trickle is what makes a rebalance test meaningful: a batch small enough to write
+// quickly is also small enough for the first consumer to drain before a second one
+// finishes joining, leaving nothing for the rebalance to move.
+func startPartitionProducer(t *testing.T, topic string, partitions int, interval time.Duration) (stop func() int) {
+	t.Helper()
+
+	conns := make([]*kafka.Conn, partitions)
+	for p := range partitions {
+		ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
+		conn, err := kafka.DialLeader(ctx, "tcp", testBroker, topic, p)
+		cancel()
+		if err != nil {
+			for _, c := range conns[:p] {
+				c.Close()
+			}
+			t.Skipf("Kafka not available: %v", err)
+		}
+		conns[p] = conn
+	}
+
+	type result struct {
+		rounds int
+		err    error
+	}
+
+	done := make(chan struct{})
+	finished := make(chan result, 1)
+
+	go func() {
+		defer func() {
+			for _, c := range conns {
+				c.Close()
+			}
+		}()
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		rounds := 0
+		for {
+			select {
+			case <-done:
+				finished <- result{rounds: rounds}
+				return
+			case <-ticker.C:
+				for p, conn := range conns {
+					msg := kafka.Message{
+						Key:   fmt.Appendf(nil, "p%d-key%d", p, rounds),
+						Value: fmt.Appendf(nil, "p%d-value%d", p, rounds),
+					}
+					if _, err := conn.WriteMessages(msg); err != nil {
+						finished <- result{rounds: rounds, err: fmt.Errorf("partition %d round %d: %w", p, rounds, err)}
+						return
+					}
+				}
+				rounds++
+			}
+		}
+	}()
+
+	var once sync.Once
+	return func() int {
+		once.Do(func() { close(done) })
+		r := <-finished
+		if r.err != nil {
+			t.Errorf("Producer failed: %v", r.err)
+		}
+		return r.rounds
+	}
+}
+
+// fetchCommittedOffsets returns -1 for partitions with no commit, and nil on a
+// transient error — it is polled from a goroutine that cannot call t.Fatal.
+func fetchCommittedOffsets(client *kafka.Client, groupID, topic string, partitions int) map[int]int64 {
+	ids := make([]int, partitions)
+	for i := range ids {
+		ids[i] = i
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp, err := client.OffsetFetch(ctx, &kafka.OffsetFetchRequest{
+		GroupID: groupID,
+		Topics:  map[string][]int{topic: ids},
+	})
+	if err != nil {
+		return nil
+	}
+
+	offsets := make(map[int]int64, partitions)
+	for _, po := range resp.Topics[topic] {
+		offsets[po.Partition] = po.CommittedOffset
+	}
+	return offsets
+}
+
+// The shape matters: consumer2 takes half of consumer1's partitions, advances them,
+// then leaves so consumer1 gets them back. Revoked, advanced elsewhere, reassigned to
+// the original owner is what breaks a consumer that never resets partition state.
+//
+// Two assertions the other rebalance tests do not make:
+//
+//   - No committed offset ever decreases. A commit racing a rebalance used to be
+//     applied under whatever generation came next.
+//
+//   - Every partition's commits reach the high-water mark. This is what a "did the
+//     offset go backwards?" check cannot see: a reacquired partition keeps its old
+//     watermark, new messages arrive above it, and the contiguous walk waits forever
+//     on a gap that never fills.
+func TestRebalanceDoesNotRewindOffsets(t *testing.T) {
+	const partitions = 4
+
+	topic := uniqueName(testTopic, "no-rewind")
+	groupID := uniqueName(testGroupID, "no-rewind-group")
+
+	createTopic(t, topic, partitions)
+	stopProducing := startPartitionProducer(t, topic, partitions, 20*time.Millisecond)
+
+	newConsumer := func(handler turnstile.MessageHandler) *turnstile.Consumer {
+		c, err := turnstile.NewConsumer(turnstile.Config{
+			Brokers:              []string{testBroker},
+			GroupID:              groupID,
+			Topic:                topic,
+			Handler:              handler,
+			MaxInFlight:          50,
+			AutoOffsetReset:      kafka.FirstOffset,
+			MaxWait:              testMaxWait,
+			MinOffsetCommitCount: 5,
+			MaxCommitInterval:    250 * time.Millisecond,
+			ForceCommitInterval:  250 * time.Millisecond,
+			// 6s is the broker's default group.min.session.timeout.ms floor; the fast
+			// heartbeat keeps the rebalance quick.
+			SessionTimeout:    6 * time.Second,
+			RebalanceTimeout:  6 * time.Second,
+			HeartbeatInterval: 500 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatalf("Failed to create consumer: %v", err)
+		}
+		return c
+	}
+
+	client := &kafka.Client{Addr: kafka.TCP(testBroker)}
+
+	var (
+		offsetMu sync.Mutex
+		maxSeen  = make(map[int]int64)
+		rewinds  []string
+	)
+
+	// observe records a committed-offset sample and flags any decrease.
+	observe := func(offsets map[int]int64) {
+		offsetMu.Lock()
+		defer offsetMu.Unlock()
+		for p, o := range offsets {
+			if o < 0 {
+				continue // never committed yet
+			}
+			if prev, ok := maxSeen[p]; ok && o < prev {
+				rewinds = append(rewinds,
+					fmt.Sprintf("partition %d rewound from %d to %d", p, prev, o))
+			}
+			if o > maxSeen[p] {
+				maxSeen[p] = o
+			}
+		}
+	}
+
+	stopPolling := make(chan struct{})
+	var pollWG sync.WaitGroup
+	pollWG.Add(1)
+	go func() {
+		defer pollWG.Done()
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopPolling:
+				return
+			case <-ticker.C:
+				if offsets := fetchCommittedOffsets(client, groupID, topic, partitions); offsets != nil {
+					observe(offsets)
+				}
+			}
+		}
+	}()
+
+	// Declared ahead of the helper below so it can close over both members.
+	var handler1Ref, handler2Ref *testMessageHandler
+
+	// A set, not a count: turnstile is at-least-once and a revoked partition's in-flight
+	// work is deliberately not drained, so messages may be handled twice.
+	processedOffsets := func() map[int]map[int64]bool {
+		seen := make(map[int]map[int64]bool, partitions)
+		for _, h := range []*testMessageHandler{handler1Ref, handler2Ref} {
+			if h == nil {
+				continue
+			}
+			for _, msg := range h.GetProcessedMessages() {
+				if seen[msg.Partition] == nil {
+					seen[msg.Partition] = make(map[int64]bool)
+				}
+				seen[msg.Partition][msg.Offset] = true
+			}
+		}
+		return seen
+	}
+
+	handler1Ref = newTestMessageHandler()
+	consumer1 := newConsumer(handler1Ref)
+	if err := consumer1.Start(); err != nil {
+		t.Fatalf("Failed to start consumer1: %v", err)
+	}
+	stopped1 := false
+	defer func() {
+		if !stopped1 {
+			consumer1.Stop()
+		}
+	}()
+
+	if !waitForCondition(30*time.Second, 50*time.Millisecond, func() bool {
+		return handler1Ref.GetProcessedCount() > 0
+	}) {
+		t.Fatal("Consumer1 never processed anything before the rebalance")
+	}
+	t.Logf("Consumer1 processed %d before the rebalance", handler1Ref.GetProcessedCount())
+
+	// A second member forces the rebalance under test.
+	handler2Ref = newTestMessageHandler()
+	consumer2 := newConsumer(handler2Ref)
+	if err := consumer2.Start(); err != nil {
+		t.Fatalf("Failed to start consumer2: %v", err)
+	}
+	stopped2 := false
+	defer func() {
+		if !stopped2 {
+			consumer2.Stop()
+		}
+	}()
+
+	// Proof that a rebalance actually moved partitions; without it the test passes
+	// trivially whenever consumer1 drains the topic before consumer2 joins. The
+	// threshold, rather than one message, also pushes the group offsets well past
+	// where consumer1 stopped.
+	const consumer2Progress = 40
+	if !waitForCondition(45*time.Second, 100*time.Millisecond, func() bool {
+		return handler2Ref.GetProcessedCount() >= consumer2Progress
+	}) {
+		t.Fatalf("Consumer2 processed only %d messages — the rebalance never moved meaningful work to it",
+			handler2Ref.GetProcessedCount())
+	}
+	t.Logf("Rebalance moved work to consumer2 (consumer1: %d, consumer2: %d)",
+		handler1Ref.GetProcessedCount(), handler2Ref.GetProcessedCount())
+
+	// Consumer1 reacquires partitions it owned in an earlier generation, and must not
+	// resume from the watermark it had then.
+	consumer1Before := handler1Ref.GetProcessedCount()
+	stopped2 = true
+	if err := consumer2.Stop(); err != nil {
+		t.Errorf("consumer2.Stop: %v", err)
+	}
+
+	// On a stale watermark the reacquired partitions would sit below a gap that never
+	// fills, and their commits would never move again.
+	if !waitForCondition(45*time.Second, 100*time.Millisecond, func() bool {
+		return handler1Ref.GetProcessedCount() >= consumer1Before+consumer2Progress
+	}) {
+		t.Fatalf("Consumer1 processed only %d more messages after reacquiring partitions",
+			handler1Ref.GetProcessedCount()-consumer1Before)
+	}
+
+	// Freeze the corpus at offsets 0..produced-1 per partition.
+	produced := stopProducing()
+	if produced == 0 {
+		t.Fatal("Producer wrote nothing")
+	}
+	t.Logf("Produced %d messages per partition across %d partitions", produced, partitions)
+
+	wantCommitted := int64(produced)
+	coveredAll := waitForCondition(60*time.Second, 200*time.Millisecond, func() bool {
+		seen := processedOffsets()
+		for p := range partitions {
+			for o := range wantCommitted {
+				if !seen[p][o] {
+					return false
+				}
+			}
+		}
+		return true
+	})
+
+	// Stop the last member so its final flush lands, then take a last sample.
+	stopped1 = true
+	if err := consumer1.Stop(); err != nil {
+		t.Errorf("consumer1.Stop: %v", err)
+	}
+
+	close(stopPolling)
+	pollWG.Wait()
+
+	final := fetchCommittedOffsets(client, groupID, topic, partitions)
+	if final == nil {
+		t.Fatal("Failed to read final committed offsets")
+	}
+	observe(final)
+
+	offsetMu.Lock()
+	observedRewinds := append([]string(nil), rewinds...)
+	offsetMu.Unlock()
+
+	for _, r := range observedRewinds {
+		t.Errorf("Committed offset went backwards across the rebalance: %s", r)
+	}
+
+	if !coveredAll {
+		seen := processedOffsets()
+		for p := range partitions {
+			var missing []int64
+			for o := range wantCommitted {
+				if !seen[p][o] {
+					missing = append(missing, o)
+				}
+			}
+			if len(missing) > 0 {
+				t.Errorf("Partition %d: %d of %d offsets never processed (first few: %v)",
+					p, len(missing), produced, missing[:min(len(missing), 10)])
+			}
+		}
+	}
+
+	// The committed offset is the next offset to read, so a fully consumed partition
+	// sits at the message count.
+	for p := range partitions {
+		if final[p] != wantCommitted {
+			t.Errorf("Partition %d committed at %d, want %d — commits stalled or never caught up",
+				p, final[p], wantCommitted)
+		}
+	}
+}
+
+// Pure unit test — no Kafka required even under the integration tag.
 func TestConfigValidate(t *testing.T) {
 	handler := newTestMessageHandler()
 	base := turnstile.Config{
@@ -1109,15 +1454,13 @@ func TestConfigValidate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("expected no error, got %v", err)
 		}
-		// Don't Start — we just want NewConsumer to succeed so we exercise the
-		// happy path of Validate. Close the reader to avoid leaks via Stop().
+		// Never started, so Stop() is only here to release the consumer group.
 		_ = c.Stop()
 	})
 }
 
-// TestMaxQueuedPerKeyOverflow drives the keySequencer past its per-key queue
-// capacity to exercise the "drop oldest" eviction path (key_sequencer.submit /
-// droppedCount), which the other tests don't reach.
+// Drives the keySequencer past its per-key capacity to reach the drop-oldest eviction
+// path, which no other test exercises.
 func TestMaxQueuedPerKeyOverflow(t *testing.T) {
 	topic := uniqueName(testTopic, "overflow")
 	groupID := uniqueName(testGroupID, "overflow")
@@ -1125,8 +1468,7 @@ func TestMaxQueuedPerKeyOverflow(t *testing.T) {
 	const total = 20
 	messages := make([]kafka.Message, total)
 	for i := range messages {
-		// All messages share the same key, so only one can process at a time and
-		// the rest queue up — driving past MaxQueuedPerKey.
+		// One shared key, so only one message processes at a time and the rest queue.
 		messages[i] = kafka.Message{Key: []byte("hot"), Value: fmt.Appendf(nil, "v-%d", i)}
 	}
 	writeMessages(t, topic, messages)
@@ -1142,8 +1484,7 @@ func TestMaxQueuedPerKeyOverflow(t *testing.T) {
 		Handler:         handler,
 		MaxInFlight:     total,
 		MaxQueuedPerKey: 2, // anything beyond 2 queued for "hot" gets evicted
-		// The default is OverflowBlock, which never drops; opt in explicitly so this
-		// test still exercises the eviction path rather than applying backpressure.
+		// The default OverflowBlock never drops, so opt in to reach the eviction path.
 		OverflowPolicy:  turnstile.OverflowDropOldest,
 		AutoOffsetReset: kafka.FirstOffset,
 		MaxWait:         testMaxWait,
@@ -1156,12 +1497,11 @@ func TestMaxQueuedPerKeyOverflow(t *testing.T) {
 	consumer.Start()
 	defer consumer.Stop()
 
-	// We can't reasonably wait for all messages — many will be dropped. Wait long
-	// enough for the fetch loop to ingest everything and the eviction path to fire.
+	// Most messages are dropped, so wait on the eviction path firing rather than on a
+	// total count.
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		// Heuristic: once handler has run >=3 times, dropping must have occurred for
-		// any queue of 2 capacity with 20 messages on one key.
+		// With capacity 2 and 20 messages on one key, 3 handler runs implies drops.
 		if handler.GetProcessedCount() >= 3 {
 			break
 		}
@@ -1178,10 +1518,8 @@ func TestMaxQueuedPerKeyOverflow(t *testing.T) {
 	}
 }
 
-// TestStopHonorsSingleShutdownBudget pins the contract that ShutdownTimeout is a
-// total budget for Stop(), not a per-phase one. Draining the key sequencer and
-// waiting on in-flight handlers previously took ShutdownTimeout each, so a stuck
-// consumer took twice the configured budget to shut down.
+// ShutdownTimeout is a total budget for Stop(), not a per-phase one. Draining the
+// sequencer and waiting on handlers previously took ShutdownTimeout each.
 func TestStopHonorsSingleShutdownBudget(t *testing.T) {
 	topic := uniqueName(testTopic, "shutdown-budget")
 	groupID := uniqueName(testGroupID, "shutdown-budget")
@@ -1191,15 +1529,14 @@ func TestStopHonorsSingleShutdownBudget(t *testing.T) {
 
 	messages := make([]kafka.Message, n)
 	for i := range messages {
-		// One hot key: the first message occupies it and the other nine sit in the
-		// sequencer queue, so the drain phase cannot complete before the deadline.
+		// One hot key, so nine messages sit queued and the drain cannot finish in time.
 		messages[i] = kafka.Message{Key: []byte("hot"), Value: fmt.Appendf(nil, "v-%d", i)}
 	}
 	writeMessages(t, topic, messages)
 
 	handler := newTestMessageHandler()
-	// Far longer than the shutdown budget, but ctx-aware, so the forced cancel is
-	// what ends it — this measures Stop()'s own bookkeeping, not a stuck handler.
+	// Far longer than the budget but ctx-aware, so the forced cancel is what ends it:
+	// this measures Stop()'s own bookkeeping, not a stuck handler.
 	handler.SetProcessingDelay(30 * time.Second)
 
 	var fetched atomic.Int64
@@ -1224,8 +1561,7 @@ func TestStopHonorsSingleShutdownBudget(t *testing.T) {
 
 	consumer.Start()
 
-	// GetKey runs on the fetch path, so this confirms every message has been
-	// submitted to the sequencer and the queue is genuinely backed up.
+	// GetKey runs on the fetch path, so this confirms the queue is genuinely backed up.
 	if !waitForCondition(messageTimeout, 10*time.Millisecond, func() bool {
 		return fetched.Load() >= int64(n)
 	}) {
@@ -1240,8 +1576,8 @@ func TestStopHonorsSingleShutdownBudget(t *testing.T) {
 	elapsed := time.Since(start)
 	t.Logf("Stop took %v with ShutdownTimeout=%v", elapsed, shutdownTimeout)
 
-	// Allowance covers the final ForceCommit and reader.Close (bounded by MaxWait),
-	// while still landing well under the 2x budget the old code spent.
+	// The allowance covers leaving the group and its final flush, while still landing
+	// well under the 2x budget the old code spent.
 	if limit := shutdownTimeout + 1500*time.Millisecond; elapsed > limit {
 		t.Errorf("Stop took %v, want <= %v (ShutdownTimeout applied more than once?)", elapsed, limit)
 	}

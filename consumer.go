@@ -12,11 +12,26 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
+// consumerGroup is the part of *kafka.ConsumerGroup the consumer drives. The
+// indirection is what lets tests exercise the lifecycle without a broker.
+type consumerGroup interface {
+	Next(ctx context.Context) (*kafka.Generation, error)
+	Close() error
+}
+
+// partitionReader is the part of *kafka.Reader a fetch loop drives, isolated for the
+// same reason as consumerGroup.
+type partitionReader interface {
+	SetOffset(offset int64) error
+	FetchMessage(ctx context.Context) (kafka.Message, error)
+	Close() error
+}
+
 type Consumer struct {
 	config        Config
 	logger        *slog.Logger
-	reader        *kafka.Reader
-	kafkaClient   *kafka.Client
+	cg            consumerGroup
+	newReader     func(kafka.PartitionAssignment) partitionReader
 	offsetManager *offsetManager
 	backpressure  *backpressureController
 	keySequencer  *keySequencer
@@ -27,6 +42,9 @@ type Consumer struct {
 	seqDone       chan struct{}
 	seqDoneOnce   sync.Once
 	wg            sync.WaitGroup
+	genMu         sync.Mutex
+	curGen        *kafka.Generation
+	curEpoch      uint64
 	running       bool
 	runningMutex  sync.Mutex
 }
@@ -50,6 +68,7 @@ func NewConsumer(config Config) (*Consumer, error) {
 		procCancel: procCancel,
 		seqDone:    make(chan struct{}),
 	}
+	c.newReader = c.newPartitionReader
 
 	c.backpressure = newBackpressureController(config.MaxInFlight)
 
@@ -57,72 +76,66 @@ func NewConsumer(config Config) (*Consumer, error) {
 		c.keySequencer = newKeySequencer(config.MaxQueuedPerKey, config.OverflowPolicy)
 	}
 
-	c.kafkaClient = &kafka.Client{
-		Addr: kafka.TCP(config.Brokers...),
-		Transport: &kafka.Transport{
-			ClientID: config.GroupID,
-		},
-	}
-
-	c.reader = kafka.NewReader(kafka.ReaderConfig{
-		Brokers:     config.Brokers,
-		Topic:       config.Topic,
-		GroupID:     config.GroupID,
-		MinBytes:    config.MinBytes,
-		MaxBytes:    config.MaxBytes,
-		MaxWait:     config.MaxWait,
-		StartOffset: config.AutoOffsetReset,
+	cg, err := kafka.NewConsumerGroup(kafka.ConsumerGroupConfig{
+		ID:      config.GroupID,
+		Brokers: config.Brokers,
+		Topics:  []string{config.Topic},
 		GroupBalancers: []kafka.GroupBalancer{
 			kafka.RangeGroupBalancer{},
 		},
+		HeartbeatInterval:      config.HeartbeatInterval,
+		SessionTimeout:         config.SessionTimeout,
+		RebalanceTimeout:       config.RebalanceTimeout,
+		PartitionWatchInterval: config.PartitionWatchInterval,
+		WatchPartitionChanges:  config.WatchPartitionChanges,
+		// Must be explicit: ConsumerGroupConfig defaults to FirstOffset, turnstile to
+		// LastOffset, so omitting this flips new groups to "earliest".
+		StartOffset: config.AutoOffsetReset,
 	})
-
-	commit := func(ctx context.Context, message kafka.Message) error {
-		return c.reader.CommitMessages(ctx, message)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create consumer group: %w", err)
 	}
+	c.cg = cg
 
-	fetchOffset := func(ctx context.Context, partition int) (int64, bool, error) {
-		request := &kafka.OffsetFetchRequest{
-			GroupID: config.GroupID,
-			Topics: map[string][]int{
-				config.Topic: {partition},
-			},
+	commit := func(ctx context.Context, epoch uint64, partition int, offset int64) error {
+		gen, ok := c.generationFor(epoch)
+		if !ok {
+			return ErrStaleGeneration
 		}
-
-		response, err := c.kafkaClient.OffsetFetch(ctx, request)
-		if err != nil {
-			return 0, false, fmt.Errorf("failed to fetch offset: %w", err)
-		}
-
-		if topicOffsets, ok := response.Topics[config.Topic]; ok {
-			for _, partitionOffset := range topicOffsets {
-				if partitionOffset.Partition == partition {
-					// hasCommitted distinguishes "never committed" (returned as -1 by Kafka) from a
-					// genuine commit at offset 0, since the two require different seed behavior.
-					if partitionOffset.CommittedOffset == -1 {
-						return 0, false, nil
-					}
-					return partitionOffset.CommittedOffset, true, nil
-				}
-			}
-		}
-
-		return 0, false, nil
+		return gen.CommitOffsets(map[string]map[int]int64{
+			c.config.Topic: {partition: nextOffsetToRead(offset)},
+		})
 	}
 
 	c.offsetManager = newOffsetManager(offsetManagerConfig{
-		topic:           config.Topic,
-		commitFunc:      commit,
-		fetchOffsetFunc: fetchOffset,
-		logger:          config.Logger,
-		minCommitCount:  config.MinOffsetCommitCount,
-		maxInterval:     config.MaxCommitInterval,
-		forceInterval:   config.ForceCommitInterval,
-		maxRetries:      config.MaxCommitRetries,
-		retryDelay:      config.CommitRetryDelay,
+		topic:          config.Topic,
+		commitFunc:     commit,
+		logger:         config.Logger,
+		minCommitCount: config.MinOffsetCommitCount,
+		maxInterval:    config.MaxCommitInterval,
+		forceInterval:  config.ForceCommitInterval,
+		maxRetries:     config.MaxCommitRetries,
+		retryDelay:     config.CommitRetryDelay,
 	})
 
 	return c, nil
+}
+
+func (c *Consumer) beginGeneration(gen *kafka.Generation) uint64 {
+	c.genMu.Lock()
+	defer c.genMu.Unlock()
+	c.curEpoch++
+	c.curGen = gen
+	return c.curEpoch
+}
+
+func (c *Consumer) generationFor(epoch uint64) (*kafka.Generation, bool) {
+	c.genMu.Lock()
+	defer c.genMu.Unlock()
+	if c.curGen == nil || c.curEpoch != epoch {
+		return nil, false
+	}
+	return c.curGen, true
 }
 
 func (c *Consumer) Start() error {
@@ -137,7 +150,7 @@ func (c *Consumer) Start() error {
 	c.logger.Info("Starting Kafka consumer", "topic", c.config.Topic)
 
 	c.wg.Add(1)
-	go c.consumeFromKafka()
+	go c.runGenerations()
 
 	if c.keySequencer != nil {
 		c.wg.Add(1)
@@ -150,33 +163,126 @@ func (c *Consumer) Start() error {
 	return nil
 }
 
-func (c *Consumer) consumeFromKafka() {
+// runGenerations is the top-level consume loop; each iteration is one generation.
+func (c *Consumer) runGenerations() {
 	defer c.wg.Done()
 
+	for {
+		gen, err := c.cg.Next(c.ctx)
+		if err != nil {
+			if errors.Is(err, kafka.ErrGroupClosed) || c.ctx.Err() != nil {
+				return
+			}
+			// cg.run applies JoinGroupBackoff internally, so this cannot spin.
+			c.logger.Error("Failed to join consumer group", "err", err)
+			continue
+		}
+
+		epoch := c.beginGeneration(gen)
+		assignments := gen.Assignments[c.config.Topic]
+
+		c.logger.Info("Joined consumer group generation",
+			"generation", gen.ID, "member", gen.MemberID,
+			"topic", c.config.Topic, "partitions", len(assignments))
+
+		c.offsetManager.BeginEpoch(epoch, assignments)
+
+		for _, pa := range assignments {
+			// Tracked on c.wg because the fetch loop spawns processMessage goroutines. An
+			// Add that races a Wait which already observed zero is both a data race and a
+			// handler still running after Stop reported everything drained.
+			c.wg.Add(1)
+			gen.Start(func(ctx context.Context) { c.runFetcher(ctx, pa) })
+		}
+
+		// Revocation hook
+		gen.Start(func(ctx context.Context) {
+			<-ctx.Done()
+			c.logger.Info("Consumer group generation ended, flushing offsets",
+				"generation", gen.ID, "topic", c.config.Topic)
+			c.offsetManager.EndEpoch(epoch)
+		})
+	}
+}
+
+// runFetcher consumes one assigned partition, then holds the generation open for the
+// rest of its life.
+func (c *Consumer) runFetcher(genCtx context.Context, pa kafka.PartitionAssignment) {
+	func() {
+		// c.wg must be released before parking below, since Stop waits on it and the park
+		// only ends once Stop closes the group.
+		defer c.wg.Done()
+		c.fetchPartition(genCtx, pa)
+	}()
+
+	// Park rather than return: Generation.Start ends the generation as soon as any
+	// started function exits, so returning on Stop() would trigger the revocation
+	// hook's final commit before in-flight handlers had drained. gen.close closes done
+	// before waiting for routines to join, so this unblocks rather than deadlocking.
+	<-genCtx.Done()
+}
+
+func (c *Consumer) newPartitionReader(pa kafka.PartitionAssignment) partitionReader {
+	return kafka.NewReader(kafka.ReaderConfig{
+		Brokers:   c.config.Brokers,
+		Topic:     c.config.Topic,
+		Partition: pa.ID,
+		MinBytes:  c.config.MinBytes,
+		MaxBytes:  c.config.MaxBytes,
+		MaxWait:   c.config.MaxWait,
+		// Per-partition readers each get their own queue, so the default would multiply
+		// prefetch buffering by the assignment count. MaxInFlight is the real bound.
+		QueueCapacity: 1,
+	})
+}
+
+// fetchPartition pumps one partition until genCtx ends or Stop halts fetching.
+func (c *Consumer) fetchPartition(genCtx context.Context, pa kafka.PartitionAssignment) {
+	r := c.newReader(pa)
+	defer func() {
+		if err := r.Close(); err != nil {
+			c.logger.Error("Failed to close partition reader", "err", err,
+				"topic", c.config.Topic, "partition", pa.ID)
+		}
+	}()
+
+	// SetOffset accepts both absolute offsets and the FirstOffset/LastOffset sentinels.
+	if err := r.SetOffset(pa.Offset); err != nil {
+		c.logger.Error("Failed to set partition start offset", "err", err,
+			"topic", c.config.Topic, "partition", pa.ID, "offset", pa.Offset)
+		return
+	}
+
+	// Stop() must halt fetches without ending the generation — see runFetcher's park.
+	fetchCtx, cancelFetch := context.WithCancel(genCtx)
+	defer cancelFetch()
+	defer context.AfterFunc(c.ctx, cancelFetch)()
+
+	c.fetchLoop(fetchCtx, r, pa.ID)
+}
+
+// fetchLoop pumps messages for a single partition until fetchCtx is canceled,
+// either by the generation ending or by Stop().
+func (c *Consumer) fetchLoop(fetchCtx context.Context, r partitionReader, partition int) {
 	var fetchBackoff time.Duration
 	const maxFetchBackoff = 5 * time.Second
 
-	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		default:
-		}
-
-		if err := c.backpressure.Acquire(c.ctx); err != nil {
+	for fetchCtx.Err() == nil {
+		if err := c.backpressure.Acquire(fetchCtx); err != nil {
 			return
 		}
 
-		msg, err := c.reader.FetchMessage(c.ctx)
+		msg, err := r.FetchMessage(fetchCtx)
 		if err != nil {
 			c.backpressure.Release()
-			if errors.Is(err, context.Canceled) {
+			if fetchCtx.Err() != nil {
 				return
 			}
-			c.logger.Error("Failed to fetch message", "err", err)
+			c.logger.Error("Failed to fetch message", "err", err,
+				"topic", c.config.Topic, "partition", partition)
 			fetchBackoff = backoffWithJitter(fetchBackoff, maxFetchBackoff)
 			select {
-			case <-c.ctx.Done():
+			case <-fetchCtx.Done():
 				return
 			case <-time.After(fetchBackoff):
 			}
@@ -188,9 +294,7 @@ func (c *Consumer) consumeFromKafka() {
 
 		key := c.config.Handler.GetKey(msg.Key, msg.Value)
 		if c.keySequencer != nil {
-			// Under OverflowBlock this blocks until the key's queue has room; the
-			// backpressure slot stays held meanwhile, which is the point.
-			acquired, evicted, err := c.keySequencer.submit(c.ctx, msg, key)
+			acquired, evicted, err := c.keySequencer.submit(fetchCtx, msg, key)
 			if err != nil {
 				c.backpressure.Release()
 				return
@@ -209,12 +313,7 @@ func (c *Consumer) consumeFromKafka() {
 	}
 }
 
-// handleOverflowDrop accounts for a message the key sequencer discarded because its
-// key's queue was full. The message is never handed to the handler, so nothing else
-// will ever mark it done — and because the offset watermark only advances over a
-// contiguous run of done offsets, skipping this would freeze commits for the partition
-// permanently. Dead-letter first, then mark done, so the offset is never committed
-// ahead of the record being persisted.
+// handleOverflowDrop accounts for a message the key sequencer discarded.
 func (c *Consumer) handleOverflowDrop(msg kafka.Message, key string) {
 	c.logger.Warn("Key queue at capacity: dropping message",
 		"policy", c.config.OverflowPolicy, "key", key,
@@ -254,10 +353,8 @@ func (c *Consumer) consumeFromKeySequencer() {
 		case <-c.procCtx.Done():
 			return
 		case <-c.seqDone:
-			// Stop() drained the queue; nothing more will be dispatched.
 			return
 		case <-c.keySequencer.readyChan():
-			// Drain until dequeue is empty, otherwise pending messages would sit idle until the next release signals.
 			for {
 				msg, key, ok := c.keySequencer.dequeue()
 				if !ok {
@@ -311,7 +408,6 @@ func (c *Consumer) processMessage(msg kafka.Message, key string) {
 			}
 		}
 
-		// procCtx so in-flight handlers can finish during graceful shutdown after the fetch loop has been canceled.
 		handlerErr = c.config.Handler.HandleMessage(c.procCtx, msg)
 		if handlerErr == nil {
 			break
@@ -356,8 +452,6 @@ func (c *Consumer) Stop() error {
 		if err := c.keySequencer.drain(shutdownCtx); err != nil {
 			c.logger.Warn("Key sequencer drain timed out", "err", err)
 		}
-		// The queue is empty (or the drain timed out); release the sequencer pump so
-		// wg.Wait() below is gated only on in-flight handlers, not on this goroutine.
 		c.seqDoneOnce.Do(func() { close(c.seqDone) })
 	}
 
@@ -379,11 +473,12 @@ func (c *Consumer) Stop() error {
 
 	c.procCancel()
 
-	c.offsetManager.ForceCommit(context.Background())
-
+	// Closing the group ends the generation, which runs the revocation hook's final
+	// commit. It must come after the drain above so in-flight handlers' MarkDone
+	// commits land under the still-live generation and the flush picks them up.
 	var closeErr error
-	if err := c.reader.Close(); err != nil {
-		c.logger.Error("Failed to close reader", "err", err)
+	if err := c.cg.Close(); err != nil {
+		c.logger.Error("Failed to close consumer group", "err", err)
 		closeErr = err
 	}
 

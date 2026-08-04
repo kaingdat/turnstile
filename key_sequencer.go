@@ -50,18 +50,15 @@ func newKeySequencer(maxQueuedPerKey int, overflowPolicy OverflowPolicy) *keySeq
 //
 //   - (true, nil, nil): key acquired; caller must process then call release.
 //   - (false, nil, nil): key busy; message has been queued.
-//   - (false, evicted, nil): the key's queue was full and the configured
-//     OverflowPolicy discarded a message. The caller takes ownership of *evicted:
-//     it will never be processed, so the caller must dead-letter it and mark its
-//     offset done, otherwise the partition watermark stalls on the gap forever.
-//   - (false, nil, err): OverflowBlock only — ctx was canceled while waiting for
-//     room in the key's queue.
+//   - (false, evicted, nil): the queue was full and OverflowPolicy discarded a
+//     message. The caller owns *evicted and must dead-letter it and mark its offset
+//     done, or the partition watermark stalls on the gap forever.
+//   - (false, nil, err): OverflowBlock only — ctx canceled while waiting for room.
 //
-// Under OverflowBlock (the default) submit blocks rather than discarding anything.
-// It holds no lock while blocked, and the sequencer is drained by a separate
-// goroutine, so a blocked submitter cannot stall the drain that would unblock it.
+// Under OverflowBlock submit holds no lock while blocked, so it cannot stall the
+// separate drain goroutine that would unblock it.
 func (ks *keySequencer) submit(ctx context.Context, msg kafka.Message, key string) (acquired bool, evicted *kafka.Message, err error) {
-	// Empty keys bypass sequencing entirely, with no ordering guarantee.
+	// Empty keys deliberately bypass sequencing, with no ordering guarantee.
 	if key == "" {
 		return true, nil, nil
 	}
@@ -102,16 +99,14 @@ func (ks *keySequencer) submit(ctx context.Context, msg kafka.Message, key strin
 			return false, &oldest, nil
 
 		case OverflowDropNewest:
-			// Queue state is untouched: the messages already accepted for this key
-			// keep their order, and nothing needs signaling.
+			// Queue state is untouched, so nothing needs signaling.
 			ks.dropped.Add(1)
 			ks.mu.Unlock()
 			return false, &msg, nil
 		}
 
-		// OverflowBlock: snapshot the current space channel before releasing the
-		// lock, then retry from the top — the key itself may have been released
-		// by the time we wake.
+		// Snapshot space before unlocking, then retry from the top — the key itself
+		// may have been released by the time we wake.
 		space := ks.space
 		ks.mu.Unlock()
 
@@ -123,7 +118,7 @@ func (ks *keySequencer) submit(ctx context.Context, msg kafka.Message, key strin
 	}
 }
 
-// releaseSpaceLocked wakes submitters blocked on a full key queue. Callers must hold ks.mu.
+// releaseSpaceLocked wakes submitters blocked on a full key queue. Requires ks.mu.
 func (ks *keySequencer) releaseSpaceLocked() {
 	close(ks.space)
 	ks.space = make(chan struct{})
@@ -150,8 +145,8 @@ func (ks *keySequencer) release(key string) {
 	ks.signal()
 }
 
-// dequeue returns the next message whose key is not currently being processed,
-// pending keys take priority to preserve FIFO order
+// dequeue returns the next message whose key is not currently being processed.
+// Pending keys take priority, which is what preserves FIFO order.
 func (ks *keySequencer) dequeue() (kafka.Message, string, bool) {
 	ks.mu.Lock()
 	defer ks.mu.Unlock()
@@ -176,8 +171,8 @@ func (ks *keySequencer) dequeue() (kafka.Message, string, bool) {
 		return mwk.msg, mwk.key, true
 	}
 
-	// Fallback scan: pendingKeys should cover every release, but this guarantees
-	// liveness if a queued message is ever left without a corresponding pending entry.
+	// Fallback scan. pendingKeys should cover every release; this guarantees liveness
+	// if a queued message is ever left without a pending entry.
 	for _, q := range ks.keyQueues {
 		if q.Len() == 0 {
 			continue

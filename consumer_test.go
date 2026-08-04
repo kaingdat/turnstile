@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -234,6 +236,152 @@ func waitForCondition(timeout time.Duration, checkInterval time.Duration, condit
 	return false
 }
 
+// fakeConsumerGroup stands in for *kafka.ConsumerGroup so the lifecycle can be driven
+// without a broker.
+type fakeConsumerGroup struct {
+	next     func(ctx context.Context) (*kafka.Generation, error)
+	closeErr error
+
+	mu     sync.Mutex
+	closes int
+}
+
+func (f *fakeConsumerGroup) Next(ctx context.Context) (*kafka.Generation, error) {
+	if f.next != nil {
+		return f.next(ctx)
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (f *fakeConsumerGroup) Close() error {
+	f.mu.Lock()
+	f.closes++
+	f.mu.Unlock()
+	return f.closeErr
+}
+
+func (f *fakeConsumerGroup) closeCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closes
+}
+
+// fakePartitionReader stands in for *kafka.Reader.
+type fakePartitionReader struct {
+	setOffsetErr error
+	closeErr     error
+	fetch        func(ctx context.Context) (kafka.Message, error)
+
+	mu         sync.Mutex
+	setOffsets []int64
+	fetches    int
+	closes     int
+}
+
+func (f *fakePartitionReader) SetOffset(offset int64) error {
+	f.mu.Lock()
+	f.setOffsets = append(f.setOffsets, offset)
+	f.mu.Unlock()
+	return f.setOffsetErr
+}
+
+func (f *fakePartitionReader) FetchMessage(ctx context.Context) (kafka.Message, error) {
+	f.mu.Lock()
+	f.fetches++
+	f.mu.Unlock()
+	if f.fetch != nil {
+		return f.fetch(ctx)
+	}
+	<-ctx.Done()
+	return kafka.Message{}, ctx.Err()
+}
+
+func (f *fakePartitionReader) Close() error {
+	f.mu.Lock()
+	f.closes++
+	f.mu.Unlock()
+	return f.closeErr
+}
+
+func (f *fakePartitionReader) fetchCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.fetches
+}
+
+func (f *fakePartitionReader) closeCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closes
+}
+
+func testLogger(t *testing.T) *slog.Logger {
+	t.Helper()
+	return slog.New(slog.NewTextHandler(testWriter{t}, nil))
+}
+
+// newFakeConsumer builds a real Consumer through NewConsumer, then swaps the broker-
+// backed consumer group for a fake. The unroutable broker keeps the real group's run
+// loop from reaching a Kafka that may be listening on the usual port.
+func newFakeConsumer(t *testing.T, config Config) (*Consumer, *fakeConsumerGroup) {
+	t.Helper()
+
+	if config.Brokers == nil {
+		config.Brokers = []string{"127.0.0.1:1"}
+	}
+	if config.GroupID == "" {
+		config.GroupID = "test-group"
+	}
+	if config.Topic == "" {
+		config.Topic = "t"
+	}
+	if config.Handler == nil {
+		config.Handler = newTestMessageHandler()
+	}
+	if config.Logger == nil {
+		config.Logger = testLogger(t)
+	}
+
+	c, err := NewConsumer(config)
+	if err != nil {
+		t.Fatalf("NewConsumer: %v", err)
+	}
+
+	if err := c.cg.Close(); err != nil {
+		t.Fatalf("closing the real consumer group: %v", err)
+	}
+	cg := &fakeConsumerGroup{}
+	c.cg = cg
+
+	t.Cleanup(func() {
+		c.cancel()
+		c.procCancel()
+	})
+
+	return c, cg
+}
+
+// newFailingCommitConsumer returns a consumer whose every commit fails, so the error
+// branches around MarkDone become reachable.
+func newFailingCommitConsumer(t *testing.T, config Config) (*Consumer, error) {
+	t.Helper()
+
+	config.MinOffsetCommitCount = 1
+	config.MaxCommitRetries = 1
+	config.CommitRetryDelay = time.Millisecond
+
+	c, _ := newFakeConsumer(t, config)
+
+	commitErr := errors.New("commit boom")
+	c.offsetManager.commitFunc = func(context.Context, uint64, int, int64) error {
+		return commitErr
+	}
+	c.offsetManager.BeginEpoch(1, []kafka.PartitionAssignment{{ID: 0, Offset: kafka.FirstOffset}})
+
+	return c, commitErr
+}
+
 func TestConfigValidation(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -340,6 +488,32 @@ func TestConfigDefaults(t *testing.T) {
 		t.Errorf("Expected default RetryDelay to be 500ms, got %v", config.RetryDelay)
 	}
 
+	// These moved out of kafka.Reader, so the defaults must match what it applied.
+	if config.SessionTimeout != 30*time.Second {
+		t.Errorf("Expected default SessionTimeout to be 30s, got %v", config.SessionTimeout)
+	}
+
+	if config.RebalanceTimeout != 30*time.Second {
+		t.Errorf("Expected default RebalanceTimeout to be 30s, got %v", config.RebalanceTimeout)
+	}
+
+	if config.HeartbeatInterval != 3*time.Second {
+		t.Errorf("Expected default HeartbeatInterval to be 3s, got %v", config.HeartbeatInterval)
+	}
+
+	if config.PartitionWatchInterval != 5*time.Second {
+		t.Errorf("Expected default PartitionWatchInterval to be 5s, got %v", config.PartitionWatchInterval)
+	}
+
+	if config.WatchPartitionChanges {
+		t.Error("Expected WatchPartitionChanges to default to false")
+	}
+
+	// kafka.ConsumerGroupConfig defaults StartOffset to FirstOffset, so a dropped
+	// mapping would silently flip new groups from "latest" to "earliest".
+	if config.AutoOffsetReset != kafka.LastOffset {
+		t.Errorf("Expected default AutoOffsetReset to be LastOffset, got %d", config.AutoOffsetReset)
+	}
 }
 
 func TestTestMessageHandler(t *testing.T) {
@@ -590,5 +764,484 @@ func TestDeadLetterPersisterCallbacks(t *testing.T) {
 	_ = persister.Save(ctx, msg, errors.New("test error"), "key1")
 	if !saveCalled {
 		t.Error("Expected save callback to be called")
+	}
+}
+
+func TestNewConsumer_RejectsInvalidKafkaConfig(t *testing.T) {
+	// Negative durations survive applyDefaults (it only fills zero values) and
+	// turnstile's own Validate, so kafka's own validation is the one that must fire.
+	_, err := NewConsumer(Config{
+		Brokers:        []string{"127.0.0.1:1"},
+		GroupID:        "g",
+		Topic:          "t",
+		Handler:        newTestMessageHandler(),
+		Logger:         testLogger(t),
+		SessionTimeout: -1,
+	})
+	if err == nil {
+		t.Fatal("expected NewConsumer to reject a negative SessionTimeout")
+	}
+	if !strings.Contains(err.Error(), "failed to create consumer group") {
+		t.Fatalf("expected the consumer group creation error to be wrapped, got %v", err)
+	}
+}
+
+func TestNewConsumer_RejectsInvalidConfig(t *testing.T) {
+	_, err := NewConsumer(Config{
+		GroupID: "g",
+		Topic:   "t",
+		Handler: newTestMessageHandler(),
+		Logger:  testLogger(t),
+	})
+	if !errors.Is(err, ErrNoBrokers) {
+		t.Fatalf("expected ErrNoBrokers, got %v", err)
+	}
+}
+
+// The commit path resolves an epoch against the live generation; without one, every
+// commit must be abandoned rather than sent under whatever generation is current.
+func TestCommitFunc_StaleGeneration(t *testing.T) {
+	c, _ := newFakeConsumer(t, Config{})
+
+	err := c.offsetManager.commitFunc(context.Background(), 1, 0, 5)
+	if !errors.Is(err, ErrStaleGeneration) {
+		t.Fatalf("expected ErrStaleGeneration with no live generation, got %v", err)
+	}
+
+	// A generation exists, but under a different epoch.
+	gen := &kafka.Generation{ID: 7}
+	epoch := c.beginGeneration(gen)
+	if got, ok := c.generationFor(epoch); !ok || got != gen {
+		t.Fatalf("generationFor(%d) = (%v, %v), want the generation just begun", epoch, got, ok)
+	}
+	if err := c.offsetManager.commitFunc(context.Background(), epoch+1, 0, 5); !errors.Is(err, ErrStaleGeneration) {
+		t.Fatalf("expected ErrStaleGeneration for a superseded epoch, got %v", err)
+	}
+}
+
+func TestStart_RejectsSecondCall(t *testing.T) {
+	c, _ := newFakeConsumer(t, Config{})
+
+	if err := c.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := c.Start(); err == nil {
+		t.Fatal("expected the second Start to fail")
+	}
+	if err := c.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	// Stop is idempotent, and a second call must not close the group again.
+	if err := c.Stop(); err != nil {
+		t.Fatalf("second Stop: %v", err)
+	}
+}
+
+// A failure to join is transient — the loop must keep trying rather than fall out and
+// leave the consumer silently idle. cg.run applies JoinGroupBackoff internally, so the
+// retry cannot spin here.
+func TestRunGenerations_RetriesAfterJoinFailure(t *testing.T) {
+	c, cg := newFakeConsumer(t, Config{})
+
+	var calls sync.WaitGroup
+	calls.Add(2)
+
+	var attempts int
+	var mu sync.Mutex
+	cg.next = func(ctx context.Context) (*kafka.Generation, error) {
+		mu.Lock()
+		attempts++
+		first := attempts == 1
+		mu.Unlock()
+
+		calls.Done()
+		if first {
+			return nil, errors.New("join boom")
+		}
+		<-ctx.Done()
+		return nil, kafka.ErrGroupClosed
+	}
+
+	if err := c.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	joined := make(chan struct{})
+	go func() {
+		calls.Wait()
+		close(joined)
+	}()
+
+	select {
+	case <-joined:
+	case <-time.After(5 * time.Second):
+		mu.Lock()
+		got := attempts
+		mu.Unlock()
+		t.Fatalf("Next called %d times after a join failure, want the loop to retry", got)
+	}
+
+	if err := c.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestStop_ReturnsConsumerGroupCloseError(t *testing.T) {
+	c, cg := newFakeConsumer(t, Config{})
+	closeErr := errors.New("close boom")
+	cg.closeErr = closeErr
+
+	if err := c.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := c.Stop(); !errors.Is(err, closeErr) {
+		t.Fatalf("expected Stop to surface the group close error, got %v", err)
+	}
+	if got := cg.closeCount(); got != 1 {
+		t.Fatalf("consumer group closed %d times, want 1", got)
+	}
+}
+
+// A reader that cannot be positioned must not be polled, and its Close error is
+// reported rather than swallowed silently.
+func TestFetchPartition_SetOffsetFailureSkipsFetching(t *testing.T) {
+	c, _ := newFakeConsumer(t, Config{})
+
+	r := &fakePartitionReader{
+		setOffsetErr: errors.New("set offset boom"),
+		closeErr:     errors.New("close boom"),
+	}
+	c.newReader = func(kafka.PartitionAssignment) partitionReader { return r }
+
+	c.fetchPartition(context.Background(), kafka.PartitionAssignment{ID: 3, Offset: kafka.FirstOffset})
+
+	if got := r.fetchCount(); got != 0 {
+		t.Fatalf("fetched %d times after SetOffset failed, want 0", got)
+	}
+	if got := r.closeCount(); got != 1 {
+		t.Fatalf("reader closed %d times, want 1", got)
+	}
+}
+
+func TestFetchLoop_StopsWhenBackpressureAcquireIsCanceled(t *testing.T) {
+	c, _ := newFakeConsumer(t, Config{MaxInFlight: 1})
+
+	// Saturate the controller so the loop's Acquire has to wait for the context.
+	if err := c.backpressure.Acquire(context.Background()); err != nil {
+		t.Fatalf("priming Acquire: %v", err)
+	}
+
+	r := &fakePartitionReader{
+		fetch: func(context.Context) (kafka.Message, error) {
+			t.Error("FetchMessage called even though backpressure was never acquired")
+			return kafka.Message{}, errors.New("unreachable")
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+	defer cancel()
+
+	c.fetchLoop(ctx, r, 0)
+
+	if got := r.fetchCount(); got != 0 {
+		t.Fatalf("fetched %d times, want 0", got)
+	}
+}
+
+// A failing broker must be retried with a growing backoff, and the wait must abort as
+// soon as the fetch context ends.
+func TestFetchLoop_BacksOffOnFetchErrorThenExitsOnCancel(t *testing.T) {
+	c, _ := newFakeConsumer(t, Config{})
+
+	r := &fakePartitionReader{
+		fetch: func(context.Context) (kafka.Message, error) {
+			return kafka.Message{}, errors.New("fetch boom")
+		},
+	}
+
+	// The first backoff is 250-375ms, the second 500-750ms, so cancelling at 600ms
+	// lands inside the second wait no matter how the jitter falls.
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(600*time.Millisecond, cancel)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.fetchLoop(ctx, r, 0)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fetchLoop did not return after its context was canceled")
+	}
+
+	if got := r.fetchCount(); got < 2 {
+		t.Fatalf("fetched %d times, want at least 2 (one per backoff round)", got)
+	}
+}
+
+// Under OverflowBlock a full key queue parks the fetch loop; cancelling the fetch
+// context has to unwind it without leaking the backpressure slot.
+func TestFetchLoop_ExitsWhenBlockedSubmitIsCanceled(t *testing.T) {
+	c, _ := newFakeConsumer(t, Config{
+		MaxInFlight:     4,
+		MaxQueuedPerKey: 1,
+		OverflowPolicy:  OverflowBlock,
+	})
+
+	// One message holds the key, a second fills its single queue slot, so the loop's
+	// submit has nowhere to put a third.
+	if acquired, _, err := c.keySequencer.submit(context.Background(), createTestMessage("t", 0, 0, "k", "v"), "k"); err != nil || !acquired {
+		t.Fatalf("submit(0) = (%v, %v), want the key acquired", acquired, err)
+	}
+	if acquired, _, err := c.keySequencer.submit(context.Background(), createTestMessage("t", 0, 1, "k", "v"), "k"); err != nil || acquired {
+		t.Fatalf("submit(1) = (%v, %v), want the message queued", acquired, err)
+	}
+
+	r := &fakePartitionReader{
+		fetch: func(context.Context) (kafka.Message, error) {
+			return createTestMessage("t", 0, 2, "k", "v"), nil
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(100*time.Millisecond, cancel)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.fetchLoop(ctx, r, 0)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fetchLoop stayed blocked on submit after its context was canceled")
+	}
+
+	// The slot taken for the message that never made it into the sequencer must have
+	// been handed back, or in-flight capacity leaks one message per canceled submit.
+	c.backpressure.cond.L.Lock()
+	inFlight := c.backpressure.current
+	c.backpressure.cond.L.Unlock()
+	if inFlight != 0 {
+		t.Fatalf("backpressure has %d slots held after the canceled submit, want 0", inFlight)
+	}
+}
+
+func TestBackoffWithJitter(t *testing.T) {
+	const maxBackoff = 5 * time.Second
+
+	first := backoffWithJitter(0, maxBackoff)
+	if first < 250*time.Millisecond || first >= 375*time.Millisecond {
+		t.Fatalf("first backoff = %v, want [250ms, 375ms)", first)
+	}
+
+	second := backoffWithJitter(250*time.Millisecond, maxBackoff)
+	if second < 500*time.Millisecond || second >= 750*time.Millisecond {
+		t.Fatalf("doubled backoff = %v, want [500ms, 750ms)", second)
+	}
+
+	capped := backoffWithJitter(maxBackoff, maxBackoff)
+	if capped < maxBackoff || capped >= maxBackoff+maxBackoff/2 {
+		t.Fatalf("capped backoff = %v, want [%v, %v)", capped, maxBackoff, maxBackoff+maxBackoff/2)
+	}
+}
+
+func TestConsumeFromKeySequencer_StopsOnProcessingContextCancel(t *testing.T) {
+	c, _ := newFakeConsumer(t, Config{})
+	c.procCancel()
+
+	done := make(chan struct{})
+	c.wg.Add(1)
+	go func() {
+		defer close(done)
+		c.consumeFromKeySequencer()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("consumeFromKeySequencer ignored its canceled processing context")
+	}
+}
+
+// Draining the sequencer still has to respect MaxInFlight, and a cancel while waiting
+// for a slot must end the loop rather than dispatch the message anyway.
+func TestConsumeFromKeySequencer_StopsWhenBackpressureAcquireIsCanceled(t *testing.T) {
+	handler := newTestMessageHandler()
+	c, _ := newFakeConsumer(t, Config{MaxInFlight: 1, Handler: handler})
+
+	if err := c.backpressure.Acquire(context.Background()); err != nil {
+		t.Fatalf("priming Acquire: %v", err)
+	}
+
+	// Leave exactly one dequeueable message behind: acquire the key, queue behind it,
+	// then release so the queued message becomes pending.
+	if acquired, _, err := c.keySequencer.submit(context.Background(), createTestMessage("t", 0, 0, "k", "v"), "k"); err != nil || !acquired {
+		t.Fatalf("submit(0) = (%v, %v), want the key acquired", acquired, err)
+	}
+	if acquired, _, err := c.keySequencer.submit(context.Background(), createTestMessage("t", 0, 1, "k", "v"), "k"); err != nil || acquired {
+		t.Fatalf("submit(1) = (%v, %v), want the message queued", acquired, err)
+	}
+	c.keySequencer.release("k")
+
+	done := make(chan struct{})
+	c.wg.Add(1)
+	go func() {
+		defer close(done)
+		c.consumeFromKeySequencer()
+	}()
+
+	time.AfterFunc(100*time.Millisecond, c.procCancel)
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("consumeFromKeySequencer stayed blocked on backpressure after cancel")
+	}
+
+	if got := handler.GetProcessedCount(); got != 0 {
+		t.Fatalf("handler ran %d times despite never getting a slot, want 0", got)
+	}
+}
+
+func TestConsumeFromKeySequencer_StopsOnDrainSignal(t *testing.T) {
+	c, _ := newFakeConsumer(t, Config{})
+
+	done := make(chan struct{})
+	c.wg.Add(1)
+	go func() {
+		defer close(done)
+		c.consumeFromKeySequencer()
+	}()
+
+	c.seqDoneOnce.Do(func() { close(c.seqDone) })
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("consumeFromKeySequencer ignored the drain signal")
+	}
+}
+
+func TestProcessMessage_LogsMarkDoneFailure(t *testing.T) {
+	handler := newTestMessageHandler()
+	c, _ := newFailingCommitConsumer(t, Config{UnOrdered: true, Handler: handler})
+
+	msg := createTestMessage("t", 0, 0, "k", "v")
+	c.offsetManager.Track(msg.Partition, msg.Offset)
+	if err := c.backpressure.Acquire(context.Background()); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+
+	c.wg.Add(1)
+	c.processMessage(msg, "k")
+
+	// A failed commit must not stop the message from being processed or the in-flight
+	// slot from coming back.
+	if got := handler.GetProcessedCount(); got != 1 {
+		t.Fatalf("handler ran %d times, want 1", got)
+	}
+	c.backpressure.cond.L.Lock()
+	inFlight := c.backpressure.current
+	c.backpressure.cond.L.Unlock()
+	if inFlight != 0 {
+		t.Fatalf("backpressure has %d slots held, want 0", inFlight)
+	}
+}
+
+// Retries must stop the moment Stop cancels the consumer, rather than sitting through
+// the remaining RetryDelay for every attempt left.
+func TestProcessMessage_AbandonsRetriesOnCancel(t *testing.T) {
+	handler := newTestMessageHandler()
+	handler.SetErrorOnKey("k", errors.New("handler boom"))
+
+	c, _ := newFakeConsumer(t, Config{
+		UnOrdered:  true,
+		Handler:    handler,
+		RetryCount: 3,
+		RetryDelay: time.Hour,
+	})
+	c.cancel()
+
+	if err := c.backpressure.Acquire(context.Background()); err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+
+	start := time.Now()
+	c.wg.Add(1)
+	c.processMessage(createTestMessage("t", 0, 0, "k", "v"), "k")
+
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("processMessage waited %v before noticing the cancel", elapsed)
+	}
+	if got := handler.GetProcessedCount(); got != 1 {
+		t.Fatalf("handler ran %d times, want 1 — retries should have been abandoned", got)
+	}
+}
+
+// Both bookkeeping steps for a dropped message can fail independently; neither may
+// stop the other from running.
+func TestHandleOverflowDrop_SurvivesPersistAndMarkDoneFailures(t *testing.T) {
+	dlq := newTestDeadLetterPersister()
+	dlq.SetSaveCallback(func(context.Context, kafka.Message, error, string) error {
+		return errors.New("persist boom")
+	})
+
+	c, _ := newFailingCommitConsumer(t, Config{
+		UnOrdered:           true,
+		OverflowPolicy:      OverflowDropNewest,
+		DeadLetterPersister: dlq,
+	})
+
+	msg := createTestMessage("t", 0, 0, "k", "v")
+	c.offsetManager.Track(msg.Partition, msg.Offset)
+	c.handleOverflowDrop(msg, "k")
+
+	// MarkDone still had to advance the watermark even though the commit failed.
+	c.offsetManager.mu.RLock()
+	s := c.offsetManager.partitions[0]
+	c.offsetManager.mu.RUnlock()
+	s.mu.Lock()
+	canCommit := s.canCommit
+	s.mu.Unlock()
+	if canCommit != 0 {
+		t.Fatalf("canCommit = %d after the drop, want 0", canCommit)
+	}
+}
+
+func TestNewPartitionReader_UsesConfiguredFetchBounds(t *testing.T) {
+	c, _ := newFakeConsumer(t, Config{
+		MinBytes: 1,
+		MaxBytes: 2048,
+		MaxWait:  250 * time.Millisecond,
+	})
+
+	r := c.newPartitionReader(kafka.PartitionAssignment{ID: 2, Offset: kafka.FirstOffset})
+	reader, ok := r.(*kafka.Reader)
+	if !ok {
+		t.Fatalf("newPartitionReader returned %T, want *kafka.Reader", r)
+	}
+	defer reader.Close()
+
+	cfg := reader.Config()
+	if cfg.Partition != 2 {
+		t.Errorf("Partition = %d, want 2", cfg.Partition)
+	}
+	if cfg.MinBytes != 1 || cfg.MaxBytes != 2048 {
+		t.Errorf("byte bounds = [%d, %d], want [1, 2048]", cfg.MinBytes, cfg.MaxBytes)
+	}
+	if cfg.MaxWait != 250*time.Millisecond {
+		t.Errorf("MaxWait = %v, want 250ms", cfg.MaxWait)
+	}
+	// Per-partition readers each buffer independently, so the queue must stay at 1 or
+	// prefetching multiplies MaxInFlight by the assignment count.
+	if cfg.QueueCapacity != 1 {
+		t.Errorf("QueueCapacity = %d, want 1", cfg.QueueCapacity)
 	}
 }

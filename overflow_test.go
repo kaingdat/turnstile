@@ -11,8 +11,8 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
-// newDropTestConsumer builds the minimal Consumer that handleOverflowDrop needs —
-// a logger, a config, and a real offsetManager — without a Kafka reader.
+// newDropTestConsumer builds the minimal Consumer handleOverflowDrop needs, with no
+// Kafka connection.
 func newDropTestConsumer(t *testing.T, dlq DeadLetterPersister) (*Consumer, func() int64) {
 	t.Helper()
 
@@ -20,11 +20,11 @@ func newDropTestConsumer(t *testing.T, dlq DeadLetterPersister) (*Consumer, func
 		mu        sync.Mutex
 		committed = int64(-1)
 	)
-	commit := func(_ context.Context, msg kafka.Message) error {
+	commit := func(_ context.Context, _ uint64, _ int, offset int64) error {
 		mu.Lock()
 		defer mu.Unlock()
-		if msg.Offset > committed {
-			committed = msg.Offset
+		if offset > committed {
+			committed = offset
 		}
 		return nil
 	}
@@ -47,6 +47,10 @@ func newDropTestConsumer(t *testing.T, dlq DeadLetterPersister) (*Consumer, func
 		}),
 	}
 
+	// Partitions only exist once a generation assigns them; the sentinel keeps the
+	// seed-from-first-message behavior these tests assume.
+	c.offsetManager.BeginEpoch(1, []kafka.PartitionAssignment{{ID: 0, Offset: kafka.FirstOffset}})
+
 	return c, func() int64 {
 		mu.Lock()
 		defer mu.Unlock()
@@ -58,11 +62,9 @@ type testWriter struct{ t *testing.T }
 
 func (w testWriter) Write(p []byte) (int, error) { return len(p), nil }
 
-// TestOverflowDrop_DoesNotStallCommits is the regression test for the bug where a
-// message evicted by the key sequencer never reached MarkDone. Because the offset
-// watermark only advances over a contiguous run of done offsets, a single evicted
-// offset used to freeze commits for the whole partition permanently and leak the
-// inFlight entry. Offsets 1 and 2 are dropped here; the watermark must still reach 3.
+// Regression: an evicted message never reached MarkDone, and since the watermark only
+// advances over a contiguous run, one such offset froze the partition's commits
+// permanently. Offsets 1 and 2 are dropped here; the watermark must still reach 3.
 func TestOverflowDrop_DoesNotStallCommits(t *testing.T) {
 	dlq := newTestDeadLetterPersister()
 	c, highestCommitted := newDropTestConsumer(t, dlq)
@@ -98,9 +100,8 @@ func TestOverflowDrop_DoesNotStallCommits(t *testing.T) {
 	}
 }
 
-// TestOverflowDrop_DeadLetters verifies dropped messages leave a record rather than
-// vanishing silently, and that they are reported with ErrKeyQueueOverflow so callers
-// can tell library-side drops apart from handler failures.
+// ErrKeyQueueOverflow is what lets callers tell library-side drops apart from handler
+// failures.
 func TestOverflowDrop_DeadLetters(t *testing.T) {
 	dlq := newTestDeadLetterPersister()
 	c, _ := newDropTestConsumer(t, dlq)
@@ -123,8 +124,7 @@ func TestOverflowDrop_DeadLetters(t *testing.T) {
 	}
 }
 
-// TestOverflowDrop_NoPersisterStillAdvancesCommits makes sure the watermark fix does
-// not depend on a DeadLetterPersister being configured.
+// The watermark fix must not depend on a DeadLetterPersister being configured.
 func TestOverflowDrop_NoPersisterStillAdvancesCommits(t *testing.T) {
 	c, highestCommitted := newDropTestConsumer(t, nil)
 	c.config.DeadLetterPersister = nil
@@ -182,6 +182,20 @@ func TestConfig_Validate_OverflowPolicy(t *testing.T) {
 		err := cfg.Validate()
 		if !errors.Is(err, ErrInvalidOverflowPolicy) {
 			t.Fatalf("policy %d: expected ErrInvalidOverflowPolicy, got %v", p, err)
+		}
+	}
+}
+
+func TestOverflowPolicy_String(t *testing.T) {
+	for policy, want := range map[OverflowPolicy]string{
+		OverflowBlock:      "block",
+		OverflowDropOldest: "drop-oldest",
+		OverflowDropNewest: "drop-newest",
+		OverflowPolicy(9):  "unknown",
+		OverflowPolicy(-1): "unknown",
+	} {
+		if got := policy.String(); got != want {
+			t.Errorf("OverflowPolicy(%d).String() = %q, want %q", policy, got, want)
 		}
 	}
 }
