@@ -1,4 +1,4 @@
-module github.com/datzero9/turnstile
+module github.com/kaingdat/turnstile
 
 go 1.23
 
