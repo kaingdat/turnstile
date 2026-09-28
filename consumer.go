@@ -47,7 +47,6 @@ type Consumer struct {
 
 func NewConsumer(config Config) (*Consumer, error) {
 	config.applyDefaults()
-
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
@@ -94,7 +93,7 @@ func NewConsumer(config Config) (*Consumer, error) {
 	}
 	c.cg = cg
 
-	c.newReader = func(fetchCtx context.Context, pa kafka.PartitionAssignment) partitionReader {
+	c.newReader = func(ctx context.Context, pa kafka.PartitionAssignment) partitionReader {
 		return kafka.NewReader(kafka.ReaderConfig{
 			Brokers:   config.Brokers,
 			Topic:     config.Topic,
@@ -105,12 +104,12 @@ func NewConsumer(config Config) (*Consumer, error) {
 			// Per-partition readers each get their own queue, so the default would multiply
 			// prefetch buffering by the assignment count.
 			QueueCapacity:   1,
-			ErrorLogger:     readerErrorLogger(fetchCtx, config.Logger, config.Topic, pa.ID),
+			ErrorLogger:     readerErrorLogger(ctx, config.Logger, config.Topic, pa.ID),
 			ReadLagInterval: -1,
 		})
 	}
 
-	commit := func(ctx context.Context, epoch uint64, partition int, offset int64) error {
+	commit := func(ctx context.Context, epoch uint64, offsets map[int]int64) error {
 		c.genMu.Lock()
 		gen, curEpoch := c.curGen, c.curEpoch
 		c.genMu.Unlock()
@@ -119,9 +118,11 @@ func NewConsumer(config Config) (*Consumer, error) {
 		}
 		// Kafka stores the next offset to read; the watermark stores the last message
 		// processed, so committing means stepping forward one.
-		return gen.CommitOffsets(map[string]map[int]int64{
-			c.config.Topic: {partition: offset + 1},
-		})
+		next := make(map[int]int64, len(offsets))
+		for partition, offset := range offsets {
+			next[partition] = offset + 1
+		}
+		return gen.CommitOffsets(map[string]map[int]int64{c.config.Topic: next})
 	}
 	c.offsetManager = newOffsetManager(offsetManagerConfig{
 		topic:          config.Topic,
@@ -165,7 +166,7 @@ func (c *Consumer) Start() error {
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
-		c.forceCommitLoop()
+		c.offsetManager.Run(c.ctx)
 	}()
 
 	return nil
@@ -305,9 +306,7 @@ func (c *Consumer) processMessage(msg kafka.Message, key string) {
 			return
 		}
 
-		if err := c.offsetManager.MarkDone(context.Background(), msg.Partition, msg.Offset); err != nil {
-			c.logger.Error("Failed to mark offset done", "err", err)
-		}
+		c.offsetManager.MarkDone(msg.Partition, msg.Offset)
 
 		if handlerErr != nil {
 			if c.config.DeadLetterPersister != nil {
@@ -354,20 +353,6 @@ func (c *Consumer) consumeFromKeySequencer() {
 	}
 }
 
-func (c *Consumer) forceCommitLoop() {
-	ticker := time.NewTicker(c.config.ForceCommitInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		case <-ticker.C:
-			c.offsetManager.ForceCommit(c.ctx)
-		}
-	}
-}
-
 func (c *Consumer) Stop() error {
 	c.runningMutex.Lock()
 	if !c.running {
@@ -409,9 +394,6 @@ func (c *Consumer) Stop() error {
 
 	c.procCancel()
 
-	// Closing the group ends the generation, which runs the revocation hook's final
-	// commit. It must come after the drain above so in-flight handlers' MarkDone
-	// commits land under the still-live generation and the flush picks them up.
 	var closeErr error
 	if err := c.cg.Close(); err != nil {
 		c.logger.Error("Failed to close consumer group", "err", err)

@@ -253,26 +253,6 @@ func newFakeConsumer(t *testing.T, config Config) (*Consumer, *fakeConsumerGroup
 	return c, cg
 }
 
-// newFailingCommitConsumer returns a consumer whose every commit fails, so the error
-// branches around MarkDone become reachable.
-func newFailingCommitConsumer(t *testing.T, config Config) (*Consumer, error) {
-	t.Helper()
-
-	config.MinOffsetCommitCount = 1
-	config.MaxCommitRetries = 1
-	config.CommitRetryDelay = time.Millisecond
-
-	c, _ := newFakeConsumer(t, config)
-
-	commitErr := errors.New("commit boom")
-	c.offsetManager.commitFunc = func(context.Context, uint64, int, int64) error {
-		return commitErr
-	}
-	c.offsetManager.BeginEpoch(1, []kafka.PartitionAssignment{{ID: 0, Offset: kafka.FirstOffset}})
-
-	return c, commitErr
-}
-
 func TestConfigValidation(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -443,7 +423,7 @@ func TestNewConsumer_RejectsInvalidConfig(t *testing.T) {
 func TestCommitFunc_StaleGeneration(t *testing.T) {
 	c, _ := newFakeConsumer(t, Config{})
 
-	err := c.offsetManager.commitFunc(context.Background(), 1, 0, 5)
+	err := c.offsetManager.commitFunc(context.Background(), 1, map[int]int64{0: 5})
 	if !errors.Is(err, ErrStaleGeneration) {
 		t.Fatalf("expected ErrStaleGeneration with no live generation, got %v", err)
 	}
@@ -455,7 +435,7 @@ func TestCommitFunc_StaleGeneration(t *testing.T) {
 	c.curGen = gen
 	epoch := c.curEpoch
 	c.genMu.Unlock()
-	if err := c.offsetManager.commitFunc(context.Background(), epoch+1, 0, 5); !errors.Is(err, ErrStaleGeneration) {
+	if err := c.offsetManager.commitFunc(context.Background(), epoch+1, map[int]int64{0: 5}); !errors.Is(err, ErrStaleGeneration) {
 		t.Fatalf("expected ErrStaleGeneration for a superseded epoch, got %v", err)
 	}
 }
@@ -719,32 +699,6 @@ func TestConsumeFromKeySequencer_StopsOnDrainSignal(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("consumeFromKeySequencer ignored the drain signal")
-	}
-}
-
-func TestProcessMessage_LogsMarkDoneFailure(t *testing.T) {
-	handler := newTestMessageHandler()
-	c, _ := newFailingCommitConsumer(t, Config{UnOrdered: true, Handler: handler})
-
-	msg := createTestMessage("t", 0, 0, "k", "v")
-	c.offsetManager.Track(msg.Partition, msg.Offset)
-	if err := c.backpressure.Acquire(context.Background()); err != nil {
-		t.Fatalf("Acquire: %v", err)
-	}
-
-	c.wg.Add(1)
-	c.processMessage(msg, "k")
-
-	// A failed commit must not stop the message from being processed or the in-flight
-	// slot from coming back.
-	if got := handler.GetProcessedCount(); got != 1 {
-		t.Fatalf("handler ran %d times, want 1", got)
-	}
-	c.backpressure.cond.L.Lock()
-	inFlight := c.backpressure.current
-	c.backpressure.cond.L.Unlock()
-	if inFlight != 0 {
-		t.Fatalf("backpressure has %d slots held, want 0", inFlight)
 	}
 }
 

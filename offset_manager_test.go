@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,7 +19,7 @@ func newTestOffsetManager(t *testing.T) *offsetManager {
 	t.Helper()
 	return newOffsetManager(offsetManagerConfig{
 		topic:          "test-topic",
-		commit:         func(context.Context, uint64, int, int64) error { return nil },
+		commit:         func(context.Context, uint64, map[int]int64) error { return nil },
 		logger:         slog.Default(),
 		minCommitCount: 5,
 		maxInterval:    1 * time.Second,
@@ -36,6 +37,17 @@ func assignSentinel(m *offsetManager, epoch uint64, partitions ...int) {
 		assignments = append(assignments, kafka.PartitionAssignment{ID: p, Offset: kafka.FirstOffset})
 	}
 	m.BeginEpoch(epoch, assignments)
+}
+
+// drainKick runs the flush Run would perform for a pending kick, keeping tests
+// synchronous. It returns nil if MarkDone did not kick.
+func drainKick(ctx context.Context, m *offsetManager) error {
+	select {
+	case <-m.kick:
+		return m.flush(ctx, false)
+	default:
+		return nil
+	}
 }
 
 // lastCommitOf returns (-1, false) if the partition is unassigned or unseeded.
@@ -72,9 +84,7 @@ func TestTrack_InitializesLastCommitOffset(t *testing.T) {
 func TestMarkDone_NoPanicOnUnknownPartition(t *testing.T) {
 	m := newTestOffsetManager(t)
 
-	if err := m.MarkDone(context.Background(), 99, 42); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	m.MarkDone(99, 42)
 }
 
 // An assignment offset of 100 is the next offset to read, so message 99 was the last
@@ -85,8 +95,10 @@ func TestBeginEpoch_SeedsFromAssignment(t *testing.T) {
 
 	m := newOffsetManager(offsetManagerConfig{
 		topic: "test-topic",
-		commit: func(_ context.Context, _ uint64, _ int, offset int64) error {
-			committed.Store(offset + 1)
+		commit: func(_ context.Context, _ uint64, offsets map[int]int64) error {
+			for _, offset := range offsets {
+				committed.Store(offset + 1)
+			}
 			return nil
 		},
 		logger:         slog.Default(),
@@ -108,8 +120,9 @@ func TestBeginEpoch_SeedsFromAssignment(t *testing.T) {
 	}
 
 	m.Track(3, 100)
-	if err := m.MarkDone(context.Background(), 3, 100); err != nil {
-		t.Fatalf("MarkDone: %v", err)
+	m.MarkDone(3, 100)
+	if err := drainKick(context.Background(), m); err != nil {
+		t.Fatalf("flush: %v", err)
 	}
 
 	if got := committed.Load(); got != 101 {
@@ -166,8 +179,10 @@ func TestBeginEpoch_ReassignmentReSeeds(t *testing.T) {
 
 	m := newOffsetManager(offsetManagerConfig{
 		topic: "test-topic",
-		commit: func(_ context.Context, _ uint64, _ int, offset int64) error {
-			committed.Store(offset + 1)
+		commit: func(_ context.Context, _ uint64, offsets map[int]int64) error {
+			for _, offset := range offsets {
+				committed.Store(offset + 1)
+			}
 			return nil
 		},
 		logger:         slog.Default(),
@@ -181,8 +196,9 @@ func TestBeginEpoch_ReassignmentReSeeds(t *testing.T) {
 	m.BeginEpoch(1, []kafka.PartitionAssignment{{ID: 3, Offset: 100}})
 	for offset := int64(100); offset <= 150; offset++ {
 		m.Track(3, offset)
-		if err := m.MarkDone(context.Background(), 3, offset); err != nil {
-			t.Fatalf("MarkDone(%d): %v", offset, err)
+		m.MarkDone(3, offset)
+		if err := drainKick(context.Background(), m); err != nil {
+			t.Fatalf("flush after %d: %v", offset, err)
 		}
 	}
 	if got, _ := lastCommitOf(m, 3); got != 150 {
@@ -203,8 +219,9 @@ func TestBeginEpoch_ReassignmentReSeeds(t *testing.T) {
 	}
 
 	m.Track(3, 400)
-	if err := m.MarkDone(context.Background(), 3, 400); err != nil {
-		t.Fatalf("MarkDone(400): %v", err)
+	m.MarkDone(3, 400)
+	if err := drainKick(context.Background(), m); err != nil {
+		t.Fatalf("flush: %v", err)
 	}
 	if got := committed.Load(); got != 401 {
 		t.Errorf("expected commit to advance to 401, got %d (partition stalled on the 151..399 gap)", got)
@@ -248,7 +265,7 @@ func TestMarkDone_AfterEndEpochIsInert(t *testing.T) {
 
 	m := newOffsetManager(offsetManagerConfig{
 		topic: "test-topic",
-		commit: func(context.Context, uint64, int, int64) error {
+		commit: func(context.Context, uint64, map[int]int64) error {
 			commits.Add(1)
 			return nil
 		},
@@ -267,22 +284,21 @@ func TestMarkDone_AfterEndEpochIsInert(t *testing.T) {
 	m.EndEpoch(1)
 	commits.Store(0)
 
-	if err := m.MarkDone(context.Background(), 0, 10); err != nil {
-		t.Fatalf("unexpected error from post-revoke MarkDone: %v", err)
-	}
+	m.MarkDone(0, 10)
+	_ = drainKick(context.Background(), m)
 	if got := commits.Load(); got != 0 {
 		t.Errorf("expected no commits after EndEpoch, got %d", got)
 	}
 }
 
-// A stale generation is terminal, not transient: retrying holds the partition lock
-// through the rebalance, exactly when it needs releasing.
+// A stale generation is terminal, not transient: retrying holds commitMu through the
+// rebalance, stalling EndEpoch's final flush.
 func TestCommit_StaleGenerationDoesNotRetry(t *testing.T) {
 	var attempts atomic.Int64
 
 	m := newOffsetManager(offsetManagerConfig{
 		topic: "test-topic",
-		commit: func(context.Context, uint64, int, int64) error {
+		commit: func(context.Context, uint64, map[int]int64) error {
 			attempts.Add(1)
 			return ErrStaleGeneration
 		},
@@ -297,7 +313,8 @@ func TestCommit_StaleGenerationDoesNotRetry(t *testing.T) {
 	m.BeginEpoch(1, []kafka.PartitionAssignment{{ID: 0, Offset: 0}})
 	m.Track(0, 0)
 
-	err := m.MarkDone(context.Background(), 0, 0)
+	m.MarkDone(0, 0)
+	err := drainKick(context.Background(), m)
 	if !errors.Is(err, ErrStaleGeneration) {
 		t.Fatalf("expected ErrStaleGeneration, got %v", err)
 	}
@@ -311,7 +328,7 @@ func TestCommit_AbortsOnGenerationEnded(t *testing.T) {
 
 	m := newOffsetManager(offsetManagerConfig{
 		topic: "test-topic",
-		commit: func(context.Context, uint64, int, int64) error {
+		commit: func(context.Context, uint64, map[int]int64) error {
 			attempts.Add(1)
 			return fmt.Errorf("commit failed: %w", kafka.ErrGenerationEnded)
 		},
@@ -325,7 +342,8 @@ func TestCommit_AbortsOnGenerationEnded(t *testing.T) {
 
 	m.BeginEpoch(1, []kafka.PartitionAssignment{{ID: 0, Offset: 0}})
 	m.Track(0, 0)
-	_ = m.MarkDone(context.Background(), 0, 0)
+	m.MarkDone(0, 0)
+	_ = drainKick(context.Background(), m)
 
 	if got := attempts.Load(); got != 1 {
 		t.Errorf("expected exactly 1 commit attempt for a wrapped ErrGenerationEnded, got %d", got)
@@ -337,7 +355,7 @@ func TestCommit_AbortsOnGenerationEnded(t *testing.T) {
 func TestCommit_HonorsCallerContext(t *testing.T) {
 	m := newOffsetManager(offsetManagerConfig{
 		topic: "test-topic",
-		commit: func(ctx context.Context, _ uint64, _ int, _ int64) error {
+		commit: func(ctx context.Context, _ uint64, _ map[int]int64) error {
 			<-ctx.Done()
 			return ctx.Err()
 		},
@@ -352,11 +370,13 @@ func TestCommit_HonorsCallerContext(t *testing.T) {
 	m.BeginEpoch(1, []kafka.PartitionAssignment{{ID: 0, Offset: 0}})
 	m.Track(0, 0)
 
+	m.MarkDone(0, 0)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- m.MarkDone(ctx, 0, 0) }()
+	go func() { done <- drainKick(ctx, m) }()
 
-	// Give MarkDone time to reach the blocking commitFunc before cancelling.
+	// Give the flush time to reach the blocking commitFunc before cancelling.
 	time.Sleep(20 * time.Millisecond)
 	cancel()
 
@@ -366,7 +386,93 @@ func TestCommit_HonorsCallerContext(t *testing.T) {
 			t.Errorf("expected context.Canceled, got %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("MarkDone did not return after its context was canceled")
+		t.Fatal("flush did not return after its context was canceled")
+	}
+}
+
+// The point of committing off the hot path: a commit stuck on the network must not
+// block Track or MarkDone for the partition it is committing.
+func TestCommit_DoesNotBlockTrackOrMarkDone(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	m := newOffsetManager(offsetManagerConfig{
+		topic: "test-topic",
+		commit: func(context.Context, uint64, map[int]int64) error {
+			close(entered)
+			<-release
+			return nil
+		},
+		logger:         slog.Default(),
+		minCommitCount: 1,
+		maxInterval:    time.Hour,
+		forceInterval:  5 * time.Second,
+		maxRetries:     1,
+		retryDelay:     time.Millisecond,
+	})
+
+	m.BeginEpoch(1, []kafka.PartitionAssignment{{ID: 0, Offset: 0}})
+	m.Track(0, 0)
+	m.MarkDone(0, 0)
+
+	done := make(chan error, 1)
+	go func() { done <- drainKick(context.Background(), m) }()
+	<-entered
+
+	hot := make(chan struct{})
+	go func() {
+		m.Track(0, 1)
+		m.MarkDone(0, 1)
+		close(hot)
+	}()
+	select {
+	case <-hot:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Track/MarkDone blocked behind an in-progress commit")
+	}
+
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	// The commit snapshot was taken before offset 1 finished, so only 0 is recorded.
+	if got, _ := lastCommitOf(m, 0); got != 0 {
+		t.Errorf("expected lastCommit=0 from the snapshot, got %d", got)
+	}
+}
+
+// One request carries every due partition, rather than one round-trip each.
+func TestFlush_BatchesPartitionsIntoOneCommit(t *testing.T) {
+	var calls []map[int]int64
+	m := newOffsetManager(offsetManagerConfig{
+		topic: "test-topic",
+		commit: func(_ context.Context, _ uint64, offsets map[int]int64) error {
+			calls = append(calls, offsets)
+			return nil
+		},
+		logger:         slog.Default(),
+		minCommitCount: 100,
+		maxInterval:    time.Hour,
+		forceInterval:  5 * time.Second,
+		maxRetries:     1,
+		retryDelay:     time.Millisecond,
+	})
+
+	assignSentinel(m, 1, 0, 1, 2)
+	for p := range 3 {
+		m.Track(p, 10)
+		m.MarkDone(p, 10)
+	}
+
+	if err := m.flush(context.Background(), true); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 commit request, got %d", len(calls))
+	}
+	want := map[int]int64{0: 10, 1: 10, 2: 10}
+	if !maps.Equal(calls[0], want) {
+		t.Errorf("committed %v, want %v", calls[0], want)
 	}
 }
 
@@ -378,8 +484,10 @@ func TestEndEpoch_FlushesBeforeDroppingState(t *testing.T) {
 
 	m := newOffsetManager(offsetManagerConfig{
 		topic: "test-topic",
-		commit: func(_ context.Context, _ uint64, _ int, offset int64) error {
-			committed.Store(offset + 1)
+		commit: func(_ context.Context, _ uint64, offsets map[int]int64) error {
+			for _, offset := range offsets {
+				committed.Store(offset + 1)
+			}
 			return nil
 		},
 		logger:         slog.Default(),
@@ -393,7 +501,7 @@ func TestEndEpoch_FlushesBeforeDroppingState(t *testing.T) {
 	m.BeginEpoch(1, []kafka.PartitionAssignment{{ID: 0, Offset: 10}})
 	for offset := int64(10); offset <= 12; offset++ {
 		m.Track(0, offset)
-		_ = m.MarkDone(context.Background(), 0, offset)
+		m.MarkDone(0, offset)
 	}
 	if got := committed.Load(); got != -1 {
 		t.Fatalf("expected no commit before EndEpoch, got %d", got)
@@ -420,7 +528,7 @@ func TestEndEpoch_IgnoresSupersededEpoch(t *testing.T) {
 
 	m := newOffsetManager(offsetManagerConfig{
 		topic: "test-topic",
-		commit: func(context.Context, uint64, int, int64) error {
+		commit: func(context.Context, uint64, map[int]int64) error {
 			commits.Add(1)
 			return nil
 		},
@@ -435,7 +543,7 @@ func TestEndEpoch_IgnoresSupersededEpoch(t *testing.T) {
 	m.BeginEpoch(1, []kafka.PartitionAssignment{{ID: 0, Offset: 10}})
 	m.BeginEpoch(2, []kafka.PartitionAssignment{{ID: 0, Offset: 10}})
 	m.Track(0, 10)
-	_ = m.MarkDone(context.Background(), 0, 10)
+	m.MarkDone(0, 10)
 
 	m.EndEpoch(1)
 
@@ -466,13 +574,15 @@ func TestTrack_UnassignedPartitionIsIgnored(t *testing.T) {
 	}
 }
 
-func TestForceCommit_CommitsDoneOffsets(t *testing.T) {
+func TestForceFlush_CommitsDoneOffsets(t *testing.T) {
 	var committed sync.Map
 
 	m := newOffsetManager(offsetManagerConfig{
 		topic: "test-topic",
-		commit: func(_ context.Context, _ uint64, partition int, offset int64) error {
-			committed.Store(partition, offset)
+		commit: func(_ context.Context, _ uint64, offsets map[int]int64) error {
+			for partition, offset := range offsets {
+				committed.Store(partition, offset)
+			}
 			return nil
 		},
 		logger:         slog.Default(),
@@ -490,12 +600,12 @@ func TestForceCommit_CommitsDoneOffsets(t *testing.T) {
 	m.Track(1, 0)
 	m.Track(1, 1)
 
-	_ = m.MarkDone(context.Background(), 0, 0)
-	_ = m.MarkDone(context.Background(), 0, 1)
-	_ = m.MarkDone(context.Background(), 1, 0)
-	_ = m.MarkDone(context.Background(), 1, 1)
+	m.MarkDone(0, 0)
+	m.MarkDone(0, 1)
+	m.MarkDone(1, 0)
+	m.MarkDone(1, 1)
 
-	m.ForceCommit(context.Background())
+	_ = m.flush(context.Background(), true)
 
 	offset0, ok0 := committed.Load(0)
 	offset1, ok1 := committed.Load(1)
@@ -513,7 +623,7 @@ func TestForceCommit_CommitsDoneOffsets(t *testing.T) {
 func TestCommitWithRetries_DoesNotAdvanceOffsetOnAllRetriesFailed(t *testing.T) {
 	m := newOffsetManager(offsetManagerConfig{
 		topic: "test-topic",
-		commit: func(context.Context, uint64, int, int64) error {
+		commit: func(context.Context, uint64, map[int]int64) error {
 			return fmt.Errorf("kafka unavailable")
 		},
 		logger:         slog.Default(),
@@ -530,9 +640,10 @@ func TestCommitWithRetries_DoesNotAdvanceOffsetOnAllRetriesFailed(t *testing.T) 
 	m.Track(0, 1)
 	m.Track(0, 2)
 
-	_ = m.MarkDone(context.Background(), 0, 0)
-	_ = m.MarkDone(context.Background(), 0, 1)
-	_ = m.MarkDone(context.Background(), 0, 2)
+	m.MarkDone(0, 0)
+	m.MarkDone(0, 1)
+	m.MarkDone(0, 2)
+	_ = drainKick(context.Background(), m)
 
 	got, ok := lastCommitOf(m, 0)
 	if !ok {
@@ -548,8 +659,10 @@ func TestSequential_CommitProgress(t *testing.T) {
 
 	m := newOffsetManager(offsetManagerConfig{
 		topic: "test-topic",
-		commit: func(_ context.Context, _ uint64, _ int, offset int64) error {
-			lastCommitted = offset
+		commit: func(_ context.Context, _ uint64, offsets map[int]int64) error {
+			for _, offset := range offsets {
+				lastCommitted = offset
+			}
 			return nil
 		},
 		logger:         slog.Default(),
@@ -566,13 +679,15 @@ func TestSequential_CommitProgress(t *testing.T) {
 		m.Track(0, i)
 	}
 
-	_ = m.MarkDone(context.Background(), 0, 0)
-	_ = m.MarkDone(context.Background(), 0, 1)
+	m.MarkDone(0, 0)
+	m.MarkDone(0, 1)
+	_ = drainKick(context.Background(), m)
 	if lastCommitted != 0 {
 		t.Errorf("expected no commit yet, got lastCommitted=%d", lastCommitted)
 	}
 
-	_ = m.MarkDone(context.Background(), 0, 2)
+	m.MarkDone(0, 2)
+	_ = drainKick(context.Background(), m)
 	if lastCommitted != 2 {
 		t.Errorf("expected lastCommitted=2, got %d", lastCommitted)
 	}
@@ -587,8 +702,10 @@ func TestConcurrentTrackMarkDone_NoRace(t *testing.T) {
 
 	m := newOffsetManager(offsetManagerConfig{
 		topic: "test-topic",
-		commit: func(_ context.Context, _ uint64, _ int, offset int64) error {
-			committed.Store(offset)
+		commit: func(_ context.Context, _ uint64, offsets map[int]int64) error {
+			for _, offset := range offsets {
+				committed.Store(offset)
+			}
 			return nil
 		},
 		logger:         slog.Default(),
@@ -607,12 +724,12 @@ func TestConcurrentTrackMarkDone_NoRace(t *testing.T) {
 		go func(offset int64) {
 			defer wg.Done()
 			m.Track(0, offset)
-			_ = m.MarkDone(context.Background(), 0, offset)
+			m.MarkDone(0, offset)
 		}(i)
 	}
 	wg.Wait()
 
-	m.ForceCommit(context.Background())
+	_ = m.flush(context.Background(), true)
 
 	if got := committed.Load(); got != N-1 {
 		t.Errorf("expected committed=%d, got %d", N-1, got)
@@ -627,11 +744,11 @@ func TestConcurrentTrackMarkDone_NoRace(t *testing.T) {
 	}
 }
 
-func TestForceCommit_NoPendingCommit(t *testing.T) {
+func TestForceFlush_NoPendingCommit(t *testing.T) {
 	commitCount := 0
 	m := newOffsetManager(offsetManagerConfig{
 		topic: "test-topic",
-		commit: func(context.Context, uint64, int, int64) error {
+		commit: func(context.Context, uint64, map[int]int64) error {
 			commitCount++
 			return nil
 		},
@@ -647,7 +764,7 @@ func TestForceCommit_NoPendingCommit(t *testing.T) {
 	m.Track(0, 5)
 
 	// Nothing marked done, so the watermark stays at lastCommitOffset.
-	m.ForceCommit(context.Background())
+	_ = m.flush(context.Background(), true)
 
 	if commitCount != 0 {
 		t.Errorf("expected no commit, got %d", commitCount)
@@ -658,7 +775,7 @@ func TestMarkDone_UnknownOffsetIsNoop(t *testing.T) {
 	commitCount := 0
 	m := newOffsetManager(offsetManagerConfig{
 		topic: "test-topic",
-		commit: func(context.Context, uint64, int, int64) error {
+		commit: func(context.Context, uint64, map[int]int64) error {
 			commitCount++
 			return nil
 		},
@@ -673,9 +790,7 @@ func TestMarkDone_UnknownOffsetIsNoop(t *testing.T) {
 	assignSentinel(m, 1, 0)
 	m.Track(0, 5)
 
-	if err := m.MarkDone(context.Background(), 0, 999); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	m.MarkDone(0, 999)
 
 	if commitCount != 0 {
 		t.Errorf("expected no commit for unknown offset, got %d", commitCount)
@@ -684,14 +799,14 @@ func TestMarkDone_UnknownOffsetIsNoop(t *testing.T) {
 
 // A failed commit must skip the in-flight cleanup, or the offsets it dropped could
 // never be retried.
-func TestForceCommit_CommitFailureSkipsCleanup(t *testing.T) {
+func TestForceFlush_CommitFailureSkipsCleanup(t *testing.T) {
 	m := newOffsetManager(offsetManagerConfig{
 		topic: "test-topic",
-		commit: func(context.Context, uint64, int, int64) error {
+		commit: func(context.Context, uint64, map[int]int64) error {
 			return fmt.Errorf("broker down")
 		},
 		logger:         slog.Default(),
-		minCommitCount: 100, // make MarkDone skip commit so ForceCommit drives it
+		minCommitCount: 100, // keep MarkDone from kicking so the forced flush drives it
 		maxInterval:    1 * time.Hour,
 		forceInterval:  5 * time.Second,
 		maxRetries:     1,
@@ -700,9 +815,9 @@ func TestForceCommit_CommitFailureSkipsCleanup(t *testing.T) {
 
 	assignSentinel(m, 1, 0)
 	m.Track(0, 0)
-	_ = m.MarkDone(context.Background(), 0, 0)
+	m.MarkDone(0, 0)
 
-	m.ForceCommit(context.Background())
+	_ = m.flush(context.Background(), true)
 
 	m.mu.RLock()
 	s := m.partitions[0]
@@ -717,12 +832,12 @@ func TestForceCommit_CommitFailureSkipsCleanup(t *testing.T) {
 	}
 }
 
-func TestForceCommit_SuccessCleansInFlight(t *testing.T) {
+func TestForceFlush_SuccessCleansInFlight(t *testing.T) {
 	m := newOffsetManager(offsetManagerConfig{
 		topic:          "test-topic",
-		commit:         func(context.Context, uint64, int, int64) error { return nil },
+		commit:         func(context.Context, uint64, map[int]int64) error { return nil },
 		logger:         slog.Default(),
-		minCommitCount: 100, // MarkDone skips commit; ForceCommit drives it
+		minCommitCount: 100, // MarkDone does not kick; the forced flush drives it
 		maxInterval:    1 * time.Hour,
 		forceInterval:  5 * time.Second,
 		maxRetries:     1,
@@ -732,10 +847,10 @@ func TestForceCommit_SuccessCleansInFlight(t *testing.T) {
 	assignSentinel(m, 1, 0)
 	m.Track(0, 0)
 	m.Track(0, 1)
-	_ = m.MarkDone(context.Background(), 0, 0)
-	_ = m.MarkDone(context.Background(), 0, 1)
+	m.MarkDone(0, 0)
+	m.MarkDone(0, 1)
 
-	m.ForceCommit(context.Background())
+	_ = m.flush(context.Background(), true)
 
 	m.mu.RLock()
 	s := m.partitions[0]
@@ -754,7 +869,7 @@ func TestCommitWithRetries_ContextCanceledDuringRetryDelay(t *testing.T) {
 	attempts := 0
 	m := newOffsetManager(offsetManagerConfig{
 		topic: "test-topic",
-		commit: func(context.Context, uint64, int, int64) error {
+		commit: func(context.Context, uint64, map[int]int64) error {
 			attempts++
 			return fmt.Errorf("transient error")
 		},
@@ -768,15 +883,16 @@ func TestCommitWithRetries_ContextCanceledDuringRetryDelay(t *testing.T) {
 
 	assignSentinel(m, 1, 0)
 	m.Track(0, 0)
-	_ = m.MarkDone(context.Background(), 0, 0) // first commit attempt happens here
+	m.MarkDone(0, 0)
+	_ = drainKick(context.Background(), m) // first commit attempt happens here
 
-	// Advance the watermark again so ForceCommit has something to retry.
+	// Advance the watermark again so the forced flush has something to retry.
 	m.Track(0, 1)
-	_ = m.MarkDone(context.Background(), 0, 1)
+	m.MarkDone(0, 1)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	m.ForceCommit(ctx)
+	_ = m.flush(ctx, true)
 
 	// The exact count is timing-dependent; only the fact that retries ran matters.
 	if attempts == 0 {
@@ -790,7 +906,7 @@ func TestEndEpoch_NoAssignedPartitions(t *testing.T) {
 	commits := 0
 	m := newOffsetManager(offsetManagerConfig{
 		topic: "test-topic",
-		commit: func(context.Context, uint64, int, int64) error {
+		commit: func(context.Context, uint64, map[int]int64) error {
 			commits++
 			return nil
 		},
@@ -815,7 +931,7 @@ func TestMarkDone_UninitializedPartition(t *testing.T) {
 	commits := 0
 	m := newOffsetManager(offsetManagerConfig{
 		topic: "test-topic",
-		commit: func(context.Context, uint64, int, int64) error {
+		commit: func(context.Context, uint64, map[int]int64) error {
 			commits++
 			return nil
 		},
@@ -828,9 +944,7 @@ func TestMarkDone_UninitializedPartition(t *testing.T) {
 
 	assignSentinel(m, 1, 0)
 
-	if err := m.MarkDone(context.Background(), 0, 7); err != nil {
-		t.Fatalf("MarkDone on an unseeded partition: %v", err)
-	}
+	m.MarkDone(0, 7)
 	if commits != 0 {
 		t.Fatalf("committed %d times without a seeded watermark, want 0", commits)
 	}
@@ -842,12 +956,12 @@ func TestCommitLocked_AbortsOnExpiredContext(t *testing.T) {
 	attempts := 0
 	m := newOffsetManager(offsetManagerConfig{
 		topic: "test-topic",
-		commit: func(context.Context, uint64, int, int64) error {
+		commit: func(context.Context, uint64, map[int]int64) error {
 			attempts++
 			return nil
 		},
 		logger: slog.Default(),
-		// High enough that MarkDone leaves the commit to ForceCommit.
+		// High enough that MarkDone does not kick, leaving the commit to the forced flush.
 		minCommitCount: 1000,
 		maxInterval:    time.Hour,
 		maxRetries:     3,
@@ -856,16 +970,14 @@ func TestCommitLocked_AbortsOnExpiredContext(t *testing.T) {
 
 	assignSentinel(m, 1, 0)
 	m.Track(0, 0)
-	if err := m.MarkDone(context.Background(), 0, 0); err != nil {
-		t.Fatalf("MarkDone: %v", err)
-	}
+	m.MarkDone(0, 0)
 	if attempts != 0 {
 		t.Fatalf("MarkDone committed %d times below the threshold, want 0", attempts)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	m.ForceCommit(ctx)
+	_ = m.flush(ctx, true)
 
 	if attempts != 0 {
 		t.Fatalf("commitFunc called %d times with an expired context, want 0", attempts)
@@ -874,11 +986,11 @@ func TestCommitLocked_AbortsOnExpiredContext(t *testing.T) {
 
 // A partition assigned but never seeded has no watermark to flush; committing from its
 // -1 placeholder would rewind the group to the start of the log.
-func TestForceCommit_SkipsUninitializedPartition(t *testing.T) {
+func TestForceFlush_SkipsUninitializedPartition(t *testing.T) {
 	commits := 0
 	m := newOffsetManager(offsetManagerConfig{
 		topic: "test-topic",
-		commit: func(context.Context, uint64, int, int64) error {
+		commit: func(context.Context, uint64, map[int]int64) error {
 			commits++
 			return nil
 		},
@@ -890,7 +1002,7 @@ func TestForceCommit_SkipsUninitializedPartition(t *testing.T) {
 	})
 
 	assignSentinel(m, 1, 0)
-	m.ForceCommit(context.Background())
+	_ = m.flush(context.Background(), true)
 
 	if commits != 0 {
 		t.Fatalf("committed %d times for an unseeded partition, want 0", commits)

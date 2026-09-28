@@ -4,14 +4,13 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"maps"
 	"sync"
 	"time"
 
 	"github.com/segmentio/kafka-go"
 )
 
-type commitFn func(ctx context.Context, epoch uint64, partition int, offset int64) error
+type commitFn func(ctx context.Context, epoch uint64, offsets map[int]int64) error
 
 type partitionState struct {
 	mu               sync.Mutex
@@ -39,8 +38,11 @@ type offsetManager struct {
 	logger         *slog.Logger
 	minCommitCount int64
 	maxInterval    time.Duration
+	forceInterval  time.Duration
 	maxRetries     int
 	retryDelay     time.Duration
+	kick           chan struct{}
+	commitMu       sync.Mutex
 	mu             sync.RWMutex
 	epoch          uint64
 	partitions     map[int]*partitionState
@@ -53,8 +55,10 @@ func newOffsetManager(config offsetManagerConfig) *offsetManager {
 		logger:         config.logger,
 		minCommitCount: config.minCommitCount,
 		maxInterval:    config.maxInterval,
+		forceInterval:  config.forceInterval,
 		maxRetries:     config.maxRetries,
 		retryDelay:     config.retryDelay,
+		kick:           make(chan struct{}, 1),
 		partitions:     make(map[int]*partitionState),
 	}
 }
@@ -106,6 +110,9 @@ func (m *offsetManager) BeginEpoch(epoch uint64, assignments []kafka.PartitionAs
 // Best-effort by design — in-flight handlers are not waited on, and their work is
 // reprocessed by the partition's new owner.
 func (m *offsetManager) EndEpoch(epoch uint64) {
+	m.commitMu.Lock()
+	defer m.commitMu.Unlock()
+
 	m.mu.Lock()
 	if m.epoch != epoch {
 		m.mu.Unlock()
@@ -125,11 +132,7 @@ func (m *offsetManager) EndEpoch(epoch uint64) {
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 
-	for partition, s := range partitions {
-		s.mu.Lock()
-		m.flushLocked(ctx, epoch, partition, s)
-		s.mu.Unlock()
-	}
+	_ = m.commitLocked(ctx, epoch, partitions, true)
 }
 
 // Track records that a message is in flight, seeding the watermark on first sight
@@ -163,40 +166,47 @@ func (m *offsetManager) Track(partition int, offset int64) {
 	s.inFlight[offset] = false
 }
 
-func (m *offsetManager) MarkDone(ctx context.Context, partition int, offset int64) error {
+func (m *offsetManager) MarkDone(partition int, offset int64) {
 	m.mu.RLock()
 	s, ok := m.partitions[partition]
-	epoch := m.epoch
 	m.mu.RUnlock()
 	if !ok {
-		return nil
+		return
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if !s.initialized {
-		return nil
+		s.mu.Unlock()
+		return
 	}
 	if _, ok := s.inFlight[offset]; !ok {
-		return nil
+		s.mu.Unlock()
+		return
 	}
 	s.inFlight[offset] = true
-
 	s.advanceLocked()
+	due := s.dueLocked(m.minCommitCount, m.maxInterval, false)
+	s.mu.Unlock()
 
-	if s.watermarkOffset <= s.lastCommitOffset {
-		return nil
+	if due {
+		select {
+		case m.kick <- struct{}{}:
+		default:
+		}
 	}
-	if s.watermarkOffset-s.lastCommitOffset < m.minCommitCount && time.Since(s.lastCommitTime) < m.maxInterval {
-		return nil
-	}
-
-	return m.commitLocked(ctx, epoch, partition, s)
 }
 
-// advanceLocked walks the watermark over the contiguous run of done offsets. Requires
-// s.mu.
+func (s *partitionState) dueLocked(minCount int64, maxInterval time.Duration, force bool) bool {
+	if !s.initialized {
+		return false
+	}
+	pending := s.watermarkOffset - s.lastCommitOffset
+	if pending <= 0 {
+		return false
+	}
+	return force || pending >= minCount || time.Since(s.lastCommitTime) >= maxInterval
+}
+
 func (s *partitionState) advanceLocked() {
 	for {
 		done, ok := s.inFlight[s.watermarkOffset+1]
@@ -207,28 +217,79 @@ func (s *partitionState) advanceLocked() {
 	}
 }
 
-// commitLocked requires s.mu.
-func (m *offsetManager) commitLocked(ctx context.Context, epoch uint64, partition int, s *partitionState) error {
+func (m *offsetManager) Run(ctx context.Context) {
+	ticker := time.NewTicker(m.forceInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-m.kick:
+			_ = m.flush(ctx, false)
+		case <-ticker.C:
+			_ = m.flush(ctx, true)
+		}
+	}
+}
+
+func (m *offsetManager) flush(ctx context.Context, force bool) error {
+	m.commitMu.Lock()
+	defer m.commitMu.Unlock()
+
+	m.mu.RLock()
+	epoch, partitions := m.epoch, m.partitions
+	m.mu.RUnlock()
+
+	return m.commitLocked(ctx, epoch, partitions, force)
+}
+
+func (m *offsetManager) commitLocked(ctx context.Context, epoch uint64, partitions map[int]*partitionState, force bool) error {
+	offsets := make(map[int]int64)
+	for partition, s := range partitions {
+		s.mu.Lock()
+		if s.dueLocked(m.minCommitCount, m.maxInterval, force) {
+			offsets[partition] = s.watermarkOffset
+		}
+		s.mu.Unlock()
+	}
+	if len(offsets) == 0 {
+		return nil
+	}
+
+	if err := m.commitWithRetry(ctx, epoch, offsets); err != nil {
+		return err
+	}
+
+	now := time.Now()
+	for partition, offset := range offsets {
+		s := partitions[partition]
+		s.mu.Lock()
+		s.lastCommitOffset = offset
+		s.lastCommitTime = now
+		for o := range s.inFlight {
+			if o <= offset {
+				delete(s.inFlight, o)
+			}
+		}
+		s.mu.Unlock()
+	}
+	m.logger.Info("Committed offsets", "topic", m.topic, "offsets", offsets)
+	return nil
+}
+
+func (m *offsetManager) commitWithRetry(ctx context.Context, epoch uint64, offsets map[int]int64) error {
 	var commitErr error
 	for retry := 0; retry < m.maxRetries; retry++ {
 		// commitFunc's network call is not context-aware, so an expired budget must be
-		// caught here or each partition still pays a full socket timeout.
+		// caught here or each attempt still pays a full socket timeout.
 		if err := ctx.Err(); err != nil {
-			m.logger.Error("Aborting offset commit", "offset", s.watermarkOffset, "topic", m.topic, "partition", partition, "err", err)
+			m.logger.Error("Aborting offset commit", "topic", m.topic, "offsets", offsets, "err", err)
 			return err
 		}
 
-		commitErr = m.commitFunc(ctx, epoch, partition, s.watermarkOffset)
+		commitErr = m.commitFunc(ctx, epoch, offsets)
 		if commitErr == nil {
-			s.lastCommitOffset = s.watermarkOffset
-			s.lastCommitTime = time.Now()
-			m.logger.Info("Committed offset", "offset", s.lastCommitOffset, "topic", m.topic, "partition", partition)
-
-			for o := range s.inFlight {
-				if o <= s.lastCommitOffset {
-					delete(s.inFlight, o)
-				}
-			}
 			return nil
 		}
 
@@ -237,49 +298,18 @@ func (m *offsetManager) commitLocked(ctx context.Context, epoch uint64, partitio
 			errors.Is(commitErr, kafka.ErrGroupClosed)
 		if staleGeneration {
 			m.logger.Warn("Abandoning offset commit: generation has ended",
-				"offset", s.watermarkOffset, "topic", m.topic, "partition", partition, "err", commitErr)
+				"topic", m.topic, "offsets", offsets, "err", commitErr)
 			return commitErr
 		}
 
-		m.logger.Error("Failed to commit offset", "offset", s.watermarkOffset, "topic", m.topic, "partition", partition, "err", commitErr, "retry", retry+1, "maxRetries", m.maxRetries)
+		m.logger.Error("Failed to commit offsets", "topic", m.topic, "offsets", offsets, "err", commitErr, "retry", retry+1, "maxRetries", m.maxRetries)
 		select {
 		case <-ctx.Done():
-			m.logger.Error("Aborting offset commit", "offset", s.watermarkOffset, "topic", m.topic, "partition", partition, "err", ctx.Err())
+			m.logger.Error("Aborting offset commit", "topic", m.topic, "offsets", offsets, "err", ctx.Err())
 			return ctx.Err()
 		case <-time.After(m.retryDelay):
 		}
 	}
 
 	return commitErr
-}
-
-// ForceCommit commits every partition's contiguous watermark, ignoring the
-// minCommitCount and maxInterval thresholds.
-func (m *offsetManager) ForceCommit(ctx context.Context) {
-	m.mu.RLock()
-	epoch := m.epoch
-	partitions := make(map[int]*partitionState, len(m.partitions))
-	maps.Copy(partitions, m.partitions)
-	m.mu.RUnlock()
-
-	for partition, s := range partitions {
-		s.mu.Lock()
-		m.flushLocked(ctx, epoch, partition, s)
-		s.mu.Unlock()
-	}
-}
-
-// flushLocked requires s.mu.
-func (m *offsetManager) flushLocked(ctx context.Context, epoch uint64, partition int, s *partitionState) {
-	if !s.initialized {
-		return
-	}
-
-	s.advanceLocked()
-
-	if s.watermarkOffset <= s.lastCommitOffset {
-		return
-	}
-
-	_ = m.commitLocked(ctx, epoch, partition, s)
 }
