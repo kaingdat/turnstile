@@ -720,9 +720,7 @@ func TestProcessMessage_AbandonsRetriesOnCancel(t *testing.T) {
 		t.Fatalf("dead-lettered %d messages, want 0 — an abandoned message isn't a conclusive failure", got)
 	}
 
-	c.offsetManager.mu.RLock()
-	s := c.offsetManager.partitions[0]
-	c.offsetManager.mu.RUnlock()
+	s := c.offsetManager.state.Load().partitions[0]
 	s.mu.Lock()
 	inFlight := slices.Clone(s.inFlight)
 	s.mu.Unlock()

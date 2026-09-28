@@ -53,9 +53,7 @@ func drainKick(ctx context.Context, m *offsetManager) error {
 
 // lastCommitOf returns (-1, false) if the partition is unassigned or unseeded.
 func lastCommitOf(m *offsetManager, partition int) (int64, bool) {
-	m.mu.RLock()
-	s, ok := m.partitions[partition]
-	m.mu.RUnlock()
+	s, ok := m.state.Load().partitions[partition]
 	if !ok {
 		return -1, false
 	}
@@ -239,18 +237,14 @@ func TestBeginEpoch_PrunesUnassignedPartitions(t *testing.T) {
 		m.Track(p, 0)
 	}
 
-	m.mu.RLock()
-	before := len(m.partitions)
-	m.mu.RUnlock()
+	before := len(m.state.Load().partitions)
 	if before != 4 {
 		t.Fatalf("expected 4 partitions in the first epoch, got %d", before)
 	}
 
 	assignSentinel(m, 2, 0, 1)
 
-	m.mu.RLock()
-	after := len(m.partitions)
-	m.mu.RUnlock()
+	after := len(m.state.Load().partitions)
 	if after != 2 {
 		t.Errorf("expected 2 partitions after reassignment, got %d", after)
 	}
@@ -514,9 +508,7 @@ func TestEndEpoch_FlushesBeforeDroppingState(t *testing.T) {
 		t.Errorf("expected EndEpoch to commit next-offset-to-read=13, got %d", got)
 	}
 
-	m.mu.RLock()
-	remaining := len(m.partitions)
-	m.mu.RUnlock()
+	remaining := len(m.state.Load().partitions)
 	if remaining != 0 {
 		t.Errorf("expected all partition state dropped after EndEpoch, got %d entries", remaining)
 	}
@@ -551,9 +543,7 @@ func TestEndEpoch_IgnoresSupersededEpoch(t *testing.T) {
 	if got := commits.Load(); got != 0 {
 		t.Errorf("expected no commits from a superseded epoch, got %d", got)
 	}
-	m.mu.RLock()
-	remaining := len(m.partitions)
-	m.mu.RUnlock()
+	remaining := len(m.state.Load().partitions)
 	if remaining != 1 {
 		t.Errorf("expected the current epoch's state to survive, got %d entries", remaining)
 	}
@@ -567,9 +557,7 @@ func TestTrack_UnassignedPartitionIsIgnored(t *testing.T) {
 
 	m.Track(7, 42)
 
-	m.mu.RLock()
-	_, ok := m.partitions[7]
-	m.mu.RUnlock()
+	_, ok := m.state.Load().partitions[7]
 	if ok {
 		t.Error("expected no state to be created for an unassigned partition")
 	}
@@ -855,9 +843,7 @@ func TestForceFlush_SuccessCleansInFlight(t *testing.T) {
 
 	_ = m.flush(context.Background(), true)
 
-	m.mu.RLock()
-	s := m.partitions[0]
-	m.mu.RUnlock()
+	s := m.state.Load().partitions[0]
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.lastCommitOffset != 1 {
@@ -1045,9 +1031,7 @@ func TestTrack_IgnoresOutOfOrderOffset(t *testing.T) {
 	m.Track(0, 11)
 	m.Track(0, 12)
 
-	m.mu.RLock()
-	s := m.partitions[0]
-	m.mu.RUnlock()
+	s := m.state.Load().partitions[0]
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	want := []inFlightOffset{{offset: 10}, {offset: 12}}

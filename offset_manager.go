@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/segmentio/kafka-go"
@@ -50,13 +51,16 @@ type offsetManager struct {
 	retryDelay     time.Duration
 	kick           chan struct{}
 	commitMu       sync.Mutex
-	mu             sync.RWMutex
-	epoch          uint64
-	partitions     map[int]*partitionState
+	state          atomic.Pointer[epochState]
+}
+
+type epochState struct {
+	epoch      uint64
+	partitions map[int]*partitionState
 }
 
 func newOffsetManager(config offsetManagerConfig) *offsetManager {
-	return &offsetManager{
+	m := &offsetManager{
 		topic:          config.topic,
 		commitFunc:     config.commit,
 		logger:         config.logger,
@@ -66,11 +70,11 @@ func newOffsetManager(config offsetManagerConfig) *offsetManager {
 		maxRetries:     config.maxRetries,
 		retryDelay:     config.retryDelay,
 		kick:           make(chan struct{}, 1),
-		partitions:     make(map[int]*partitionState),
 	}
+	m.state.Store(&epochState{partitions: map[int]*partitionState{}})
+	return m
 }
 
-// BeginEpoch installs the partition set for a new consumer group generation.
 func (m *offsetManager) BeginEpoch(epoch uint64, assignments []kafka.PartitionAssignment) {
 	partitions := make(map[int]*partitionState, len(assignments))
 	now := time.Now()
@@ -100,10 +104,7 @@ func (m *offsetManager) BeginEpoch(epoch uint64, assignments []kafka.PartitionAs
 		partitions[pa.ID] = s
 	}
 
-	m.mu.Lock()
-	m.epoch = epoch
-	m.partitions = partitions
-	m.mu.Unlock()
+	m.state.Store(&epochState{epoch: epoch, partitions: partitions})
 }
 
 // EndEpoch flushes every owned partition one last time, then drops all state.
@@ -119,14 +120,14 @@ func (m *offsetManager) EndEpoch(epoch uint64) {
 	m.commitMu.Lock()
 	defer m.commitMu.Unlock()
 
-	m.mu.Lock()
-	if m.epoch != epoch {
-		m.mu.Unlock()
+	cur := m.state.Load()
+	if cur.epoch != epoch {
 		return
 	}
-	partitions := m.partitions
-	m.partitions = make(map[int]*partitionState)
-	m.mu.Unlock()
+	if !m.state.CompareAndSwap(cur, &epochState{epoch: epoch, partitions: map[int]*partitionState{}}) {
+		return
+	}
+	partitions := cur.partitions
 
 	if len(partitions) == 0 {
 		return
@@ -148,9 +149,7 @@ func (m *offsetManager) EndEpoch(epoch uint64) {
 // it would resurrect the state BeginEpoch just pruned. Dropping it loses nothing,
 // since an untracked offset is never committed and so is redelivered.
 func (m *offsetManager) Track(partition int, offset int64) {
-	m.mu.RLock()
-	s, ok := m.partitions[partition]
-	m.mu.RUnlock()
+	s, ok := m.state.Load().partitions[partition]
 	if !ok {
 		m.logger.Debug("Ignoring message for unassigned partition",
 			"topic", m.topic, "partition", partition, "offset", offset)
@@ -185,9 +184,7 @@ func (m *offsetManager) Track(partition int, offset int64) {
 }
 
 func (m *offsetManager) MarkDone(partition int, offset int64) {
-	m.mu.RLock()
-	s, ok := m.partitions[partition]
-	m.mu.RUnlock()
+	s, ok := m.state.Load().partitions[partition]
 	if !ok {
 		return
 	}
@@ -262,11 +259,8 @@ func (m *offsetManager) flush(ctx context.Context, force bool) error {
 	m.commitMu.Lock()
 	defer m.commitMu.Unlock()
 
-	m.mu.RLock()
-	epoch, partitions := m.epoch, m.partitions
-	m.mu.RUnlock()
-
-	return m.commitLocked(ctx, epoch, partitions, force)
+	st := m.state.Load()
+	return m.commitLocked(ctx, st.epoch, st.partitions, force)
 }
 
 func (m *offsetManager) commitLocked(ctx context.Context, epoch uint64, partitions map[int]*partitionState, force bool) error {
