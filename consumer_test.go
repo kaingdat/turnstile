@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -96,31 +97,6 @@ func createTestMessage(topic string, partition int, offset int64, key, value str
 		Value:     []byte(value),
 		Time:      time.Now(),
 	}
-}
-
-func createTestMessages(topic string, partition int, count int, keyPrefix, valuePrefix string) []kafka.Message {
-	messages := make([]kafka.Message, count)
-	for i := range count {
-		messages[i] = createTestMessage(
-			topic,
-			partition,
-			int64(i),
-			fmt.Sprintf("%s-%d", keyPrefix, i),
-			fmt.Sprintf("%s-%d", valuePrefix, i),
-		)
-	}
-	return messages
-}
-
-func waitForCondition(timeout time.Duration, checkInterval time.Duration, condition func() bool) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if condition() {
-			return true
-		}
-		time.Sleep(checkInterval)
-	}
-	return false
 }
 
 // fakeConsumerGroup stands in for *kafka.ConsumerGroup so the lifecycle can be driven
@@ -748,10 +724,10 @@ func TestProcessMessage_AbandonsRetriesOnCancel(t *testing.T) {
 	s := c.offsetManager.partitions[0]
 	c.offsetManager.mu.RUnlock()
 	s.mu.Lock()
-	done, tracked := s.inFlight[0]
+	inFlight := slices.Clone(s.inFlight)
 	s.mu.Unlock()
-	if !tracked || done {
-		t.Fatalf("inFlight[0] = (%v, %v), want (false, true) — abandoned offset must stay uncommitted", done, tracked)
+	if want := []inFlightOffset{{offset: 0}}; !slices.Equal(inFlight, want) {
+		t.Fatalf("inFlight = %v, want %v — abandoned offset must stay uncommitted", inFlight, want)
 	}
 }
 
@@ -767,7 +743,11 @@ func TestNewReader_UsesConfiguredFetchBounds(t *testing.T) {
 	if !ok {
 		t.Fatalf("newReader returned %T, want *kafka.Reader", r)
 	}
-	defer reader.Close()
+	defer func() {
+		if err := reader.Close(); err != nil {
+			t.Errorf("closing reader: %v", err)
+		}
+	}()
 
 	cfg := reader.Config()
 	if cfg.Partition != 2 {

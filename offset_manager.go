@@ -1,9 +1,11 @@
 package turnstile
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -18,7 +20,12 @@ type partitionState struct {
 	lastCommitOffset int64
 	watermarkOffset  int64
 	lastCommitTime   time.Time
-	inFlight         map[int64]bool
+	inFlight         []inFlightOffset
+}
+
+type inFlightOffset struct {
+	offset int64
+	done   bool
 }
 
 type offsetManagerConfig struct {
@@ -72,7 +79,6 @@ func (m *offsetManager) BeginEpoch(epoch uint64, assignments []kafka.PartitionAs
 		s := &partitionState{
 			lastCommitOffset: -1,
 			watermarkOffset:  -1,
-			inFlight:         make(map[int64]bool),
 		}
 
 		// A negative pa.Offset is a FirstOffset/LastOffset sentinel meaning the group has no
@@ -163,7 +169,19 @@ func (m *offsetManager) Track(partition int, offset int64) {
 		s.initialized = true
 	}
 
-	s.inFlight[offset] = false
+	// Anything not above the newest tracked offset would break the ordering that
+	// MarkDone's binary search and the watermark walk rely on.
+	newest := s.watermarkOffset
+	if n := len(s.inFlight); n > 0 {
+		newest = s.inFlight[n-1].offset
+	}
+	if offset <= newest {
+		m.logger.Debug("Ignoring out-of-order offset",
+			"topic", m.topic, "partition", partition, "offset", offset, "newest", newest)
+		return
+	}
+
+	s.inFlight = append(s.inFlight, inFlightOffset{offset: offset})
 }
 
 func (m *offsetManager) MarkDone(partition int, offset int64) {
@@ -179,12 +197,17 @@ func (m *offsetManager) MarkDone(partition int, offset int64) {
 		s.mu.Unlock()
 		return
 	}
-	if _, ok := s.inFlight[offset]; !ok {
+	i, ok := slices.BinarySearchFunc(s.inFlight, offset, func(e inFlightOffset, target int64) int {
+		return cmp.Compare(e.offset, target)
+	})
+	if !ok {
 		s.mu.Unlock()
 		return
 	}
-	s.inFlight[offset] = true
-	s.advanceLocked()
+	s.inFlight[i].done = true
+	if i == 0 {
+		s.advanceLocked()
+	}
 	due := s.dueLocked(m.minCommitCount, m.maxInterval, false)
 	s.mu.Unlock()
 
@@ -208,13 +231,15 @@ func (s *partitionState) dueLocked(minCount int64, maxInterval time.Duration, fo
 }
 
 func (s *partitionState) advanceLocked() {
-	for {
-		done, ok := s.inFlight[s.watermarkOffset+1]
-		if !ok || !done {
-			return
-		}
-		s.watermarkOffset++
+	n := 0
+	for n < len(s.inFlight) && s.inFlight[n].done {
+		n++
 	}
+	if n == 0 {
+		return
+	}
+	s.watermarkOffset = s.inFlight[n-1].offset
+	s.inFlight = s.inFlight[n:]
 }
 
 func (m *offsetManager) Run(ctx context.Context) {
@@ -267,11 +292,6 @@ func (m *offsetManager) commitLocked(ctx context.Context, epoch uint64, partitio
 		s.mu.Lock()
 		s.lastCommitOffset = offset
 		s.lastCommitTime = now
-		for o := range s.inFlight {
-			if o <= offset {
-				delete(s.inFlight, o)
-			}
-		}
 		s.mu.Unlock()
 	}
 	m.logger.Info("Committed offsets", "topic", m.topic, "offsets", offsets)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -718,12 +719,14 @@ func TestConcurrentTrackMarkDone_NoRace(t *testing.T) {
 
 	assignSentinel(m, 1, 0)
 
+	// Mirrors the consumer: one fetch loop tracks in order, handlers finish in any
+	// order.
 	var wg sync.WaitGroup
 	for i := range int64(N) {
+		m.Track(0, i)
 		wg.Add(1)
 		go func(offset int64) {
 			defer wg.Done()
-			m.Track(0, offset)
 			m.MarkDone(0, offset)
 		}(i)
 	}
@@ -797,9 +800,9 @@ func TestMarkDone_UnknownOffsetIsNoop(t *testing.T) {
 	}
 }
 
-// A failed commit must skip the in-flight cleanup, or the offsets it dropped could
-// never be retried.
-func TestForceFlush_CommitFailureSkipsCleanup(t *testing.T) {
+// A failed commit must leave the watermark ahead of lastCommit, or the next flush
+// would have nothing to retry.
+func TestForceFlush_RetriesAfterCommitFailure(t *testing.T) {
 	m := newOffsetManager(offsetManagerConfig{
 		topic: "test-topic",
 		commit: func(context.Context, uint64, map[int]int64) error {
@@ -819,16 +822,16 @@ func TestForceFlush_CommitFailureSkipsCleanup(t *testing.T) {
 
 	_ = m.flush(context.Background(), true)
 
-	m.mu.RLock()
-	s := m.partitions[0]
-	m.mu.RUnlock()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, present := s.inFlight[0]; !present {
-		t.Fatal("expected offset 0 to remain in inFlight after commit failure")
+	if got, _ := lastCommitOf(m, 0); got != -1 {
+		t.Fatalf("expected lastCommit unchanged at -1 after failure, got %d", got)
 	}
-	if s.lastCommitOffset != -1 {
-		t.Errorf("expected lastCommit unchanged at -1, got %d", s.lastCommitOffset)
+
+	m.commitFunc = func(context.Context, uint64, map[int]int64) error { return nil }
+	if err := m.flush(context.Background(), true); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if got, _ := lastCommitOf(m, 0); got != 0 {
+		t.Errorf("expected the retry to commit 0, got %d", got)
 	}
 }
 
@@ -1006,5 +1009,49 @@ func TestForceFlush_SkipsUninitializedPartition(t *testing.T) {
 
 	if commits != 0 {
 		t.Fatalf("committed %d times for an unseeded partition, want 0", commits)
+	}
+}
+
+// Compacted topics and transaction markers leave offsets that are never delivered;
+// the watermark must cross them rather than wait for watermark+1 forever.
+func TestMarkDone_WatermarkCrossesOffsetGaps(t *testing.T) {
+	m := newTestOffsetManager(t)
+	m.BeginEpoch(1, []kafka.PartitionAssignment{{ID: 0, Offset: 100}})
+
+	// 100..104 were compacted away, and 107 was a transaction marker.
+	for _, offset := range []int64{105, 106, 108} {
+		m.Track(0, offset)
+	}
+	m.MarkDone(0, 108)
+	m.MarkDone(0, 105)
+	m.MarkDone(0, 106)
+
+	if err := m.flush(context.Background(), true); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if got, _ := lastCommitOf(m, 0); got != 108 {
+		t.Errorf("expected lastCommit=108 across the gaps, got %d", got)
+	}
+}
+
+// An offset tracked out of order would break the sorted invariant MarkDone's binary
+// search depends on, so it is dropped and left for redelivery.
+func TestTrack_IgnoresOutOfOrderOffset(t *testing.T) {
+	m := newTestOffsetManager(t)
+	assignSentinel(m, 1, 0)
+
+	m.Track(0, 10)
+	m.Track(0, 12)
+	m.Track(0, 11)
+	m.Track(0, 12)
+
+	m.mu.RLock()
+	s := m.partitions[0]
+	m.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	want := []inFlightOffset{{offset: 10}, {offset: 12}}
+	if !slices.Equal(s.inFlight, want) {
+		t.Errorf("inFlight = %v, want %v", s.inFlight, want)
 	}
 }
